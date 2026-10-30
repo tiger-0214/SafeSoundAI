@@ -1,0 +1,38 @@
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- data (never commit) ---
+1_Original_Database/
+2_Preprocessed_Data/
+data/
+*.npy
+*.npz
+*.wav
+*.mp3
+*.flac
+metadata*.csv
+
+# --- model weights / artefacts ---
+outputs/
+*.pt
+*.pth
+*.onnx
+*.torchscript*
+*.ckpt
+
+# --- generated ---
+figs/
+*.mp4
+*.gif
+*.png
+!docs/**/*.png
+
+# --- editor / os ---
+.obsidian/
+.vscode/
+.DS_Store
+~$*
