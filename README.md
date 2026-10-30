@@ -129,7 +129,7 @@ The cliff at 0.5 s is a **training-distribution problem, not an information prob
 - Fireworks was evaluated as a fourth hazard and dropped: 360 segments total, recall .444, single-fold variance too large to select on.
 - No direction of arrival, so no spatial encoding.
 - No human participants; the amplitude axis and the 9-code vocabulary are unvalidated with users.
-- Operational false-alarm rate was measured on the v2 model (49.1/h at τ = 0.8) and has not been re-measured for v3.
+- Operational event-level recall and false-alarm rate were measured on the **legacy 10-class checkpoint** `ds_cnn_best.pth` (report `emergency_eval.md`), not on the current 4-class model: τ = 0.8 → 77.0% recall / 49.1 false alarms per hour; τ = 0.5 → 83.3% / 123.8 per hour. Neither operating point meets the gating precondition (≥95% / ≤5). **Not yet re-measured for v3.**
 
 ## Data (not included)
 
