@@ -22,7 +22,8 @@ Notes
 -----
 * Model input is 128 log-Mel x 100 frames at n_fft=1024 (640/160 win/hop, 16 kHz).
 * The 1-s analysis window is the current latency bottleneck: compute is 2-4 ms,
-  the cost is waiting for the buffer to fill (see reports/winlen_bench.md).
+  the cost is waiting for the buffer to fill (1.0 s .8865 / 0.5 s .7192 /
+  0.3 s .5615 accuracy, same checkpoint).
 * Urgency uses the semantic prior + duration + repetition only. Audio level is
   deliberately NOT used (AGC and mic coupling destroy absolute level).
 """
