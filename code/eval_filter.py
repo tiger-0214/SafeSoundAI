@@ -82,6 +82,9 @@ def main() -> None:
                     help="安全强度 α（1=原生掩码；0.35=守白名单 3 dB 红线的保守档）")
     ap.add_argument("--alpha-grid", action="store_true",
                     help="额外输出 α 权衡曲线（Supp/Pres/gap/红线超标率）")
+    ap.add_argument("--gain-strength", type=float, default=None,
+                    help="方案 A 的类增益强度 α（默认 fc.GAIN_STRENGTH）。"
+                         "注意与 --strength（方案 B 的 TSE α）是两个独立的旋钮")
     ap.add_argument("--mode", choices=["aed", "oracle", "both"], default="both",
                     help="aed=AED 驱动（部署现状）；oracle=真值 one-hot（机理上界）；both=双轨同时出数")
     args = ap.parse_args()
@@ -95,7 +98,7 @@ def main() -> None:
     if not rows:
         raise SystemExit(f"manifest 无 {args.split} 样本")
 
-    att = SpectralGateAttenuator(profile=args.profile)
+    att = SpectralGateAttenuator(profile=args.profile, strength=args.gain_strength)
     tse = None
     if Path(args.tse_ckpt).exists():
         ck = torch.load(args.tse_ckpt, map_location=DEVICE)
@@ -233,6 +236,7 @@ def main() -> None:
                          "trigger_rate_pct": round(100 * float(np.mean(col("A_oracle_supp_db") < -1.0)), 1)},
         },
         "strength": args.strength if args.strength is not None else fc.TSE_STRENGTH,
+        "gain_strength": args.gain_strength if args.gain_strength is not None else fc.GAIN_STRENGTH,
         "alpha_grid": ([{"alpha": a,
                          "supp_db_mean": round(float(np.mean([r[f"supp_a{a}"] for r in alpha_rows])), 2),
                          "pres_db_mean": round(float(np.mean([r[f"pres_a{a}"] for r in alpha_rows])), 2),

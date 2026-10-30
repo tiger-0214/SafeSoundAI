@@ -52,6 +52,7 @@ Every path resolves from `config.py`; override the preprocessed-data root with `
 | `eval_filter.py` | measured attenuation vs whitelist preservation |
 | `ablate_filter.py` | 2x2 ablation (z-score / carve-out) on the real mixture set → `filter_ablation.md` |
 | `gen_ab_demo.py` | audible before/after pairs with separate target / interferer stems |
+| `audit_filter_numbers.py` | provenance audit: recomputes every number in `filter_ab_report.md` from `filter_per_sample.csv` and the sweep JSONs, re-runs the ablation, and exits non-zero on any mismatch (`--ablate` for the slow layer) |
 
 ## Vocabulary
 

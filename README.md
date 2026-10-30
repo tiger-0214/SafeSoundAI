@@ -113,23 +113,23 @@ The attenuation branch is a class-conditioned spectral gate: an AED posterior se
 
 Two bugs made the branch look like it did nothing, and both are now fixed (`vocab.py` documents the class-space rule behind one of them):
 
-1. **No per-window normalisation at inference.** The segments the model was trained on are z-scored; the gate fed raw waveforms to the mel transform, so the posterior was systematically wrong. Measured on 200 real mixtures: top-1 against the true noise class went from 0.17 to **0.53** once every window was z-scored.
+1. **No per-window normalisation at inference.** The segments the model was trained on are z-scored; the gate fed raw waveforms to the mel transform, so the posterior was systematically wrong. Top-1 against the true noise class, same 200 real mixtures: 0.120 raw -> **0.525** z-scored (top-3 0.800). On the deployed 4-class head the effect is visible as sensitivity rather than accuracy: it labels the noise mixture `background` in 90.5 % of cases raw, 72.0 % after z-scoring, i.e. 28 % of mixtures get misread as a hazard - which is exactly why the carve-out below is needed instead of a veto.
 2. **Whitelist veto instead of whitelist carve-out.** Any whitelist class above p = 0.5 used to let the whole 1 s window through untouched. Since noise is frequently misread as `car_horn`, the gate sat idle exactly when it was needed. It now attenuates and gives back only the whitelist class's own energy band.
 
 Ablation on 100 test mixtures (`ablate_filter.py`, 1 s, target = noise to suppress, interferer = whitelisted hazard to keep):
 
-| Configuration | Suppression (dB) | Preservation (dB) | Red line violated |
-|:--|--:|--:|--:|
-| previous logic | -0.37 | -0.43 | 7 % |
-| + per-window z-score | -3.70 | -3.10 | 39 % |
-| + carve-out only | -0.35 | -0.40 | 7 % |
-| + both (current) | **-3.51** | **-2.93** | 37 % |
+| Configuration | Suppression (dB) | Preservation (dB) | Trigger rate | Red line violated |
+|:--|--:|--:|--:|--:|
+| previous logic | -1.52 | -1.59 | 26 % | 22 % |
+| + per-window z-score | -4.28 | -3.51 | 54 % | 46 % |
+| + carve-out only | -1.25 | -1.30 | 28 % | 21 % |
+| + both (current) | **-4.06** | **-3.32** | 57 % | 43 % |
 
-The honest reading: attenuation is now real (-3.5 dB instead of -0.4 dB), but **selectivity is not**, and that is a property of the method rather than of the tuning. A gain applied to a whole frequency band cannot separate a jackhammer from a horn overlapping it in time and frequency; shrinking the safety strength only scales both columns down proportionally (alpha = 0.4 gives -1.35 / -1.05 dB), which is exactly the trade-off already measured for the TSE branch. Recovering selectivity needs a separation model, not a gate, which is why the hard gate stays disabled (`filter_config.ALLOW_GATING = False`).
+The honest reading: attenuation is now real (-4.06 dB instead of -1.52 dB), but **selectivity is not** (-0.74 dB against +0.07 dB), and that is a property of the method rather than of the tuning. A gain applied to a whole frequency band cannot separate a jackhammer from a horn overlapping it in time and frequency; shrinking the safety strength only scales both columns down proportionally (class-gain alpha = 0.4 gives -1.86 / -1.33 dB, so the Supp-Pres ratio stays at 0.25-0.28; the TSE branch behaves the same way, -3.39 / -2.68 dB at its own alpha = 0.4). Recovering selectivity needs a separation model, not a gate, which is why the hard gate stays disabled (`filter_config.ALLOW_GATING = False`).
 
 `eval_filter.py --n 100` on the same split, both branches: AED gate -4.06 dB suppression / -3.32 dB preservation (57 % of mixtures trigger); conditional TSE -13.89 / -9.58 dB, whose selectivity is likewise about 4 dB at 3.4x the suppression.
 
-Warning about the listening material: before this round the only demo audio was `outputs/audio/0X_*.wav`, which turned out to be **220 Hz sine placeholders** (2.50 s each, spectral peak at 220 Hz, `00_air_conditioner` identical in content to `08_siren`). Every earlier "the detector cannot tell these apart" conclusion drawn from them was an artefact of the fake audio. `gen_ab_demo.py` now builds sample pairs from the real mixture corpus with stems, so each pair can be checked by ear and by the numbers at once.
+Warning about the listening material: before this round the only demo audio was the ten files `outputs/audio/0X_*.wav`, which turned out to be **220 Hz sine placeholders** (2.50 s each, spectral peak at 220 Hz, quantisation step identical in all ten, and `00_air_conditioner` bit-identical to `08_siren`). Every earlier "the detector cannot tell these apart" conclusion drawn from them was an artefact of the fake audio. `gen_ab_demo.py` now builds sample pairs from the real mixture corpus with stems, so each pair can be checked by ear and by the numbers at once.
 
 ---
 
