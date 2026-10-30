@@ -140,7 +140,7 @@ Point `SAFESOUND_DATA_DIR` at a preprocessed directory to run anything that need
 
 ## Contact
 
-Qingming Li · MSc Data Science and Machine Learning, UCL · qingming.li@ucl.ac.uk
+Qingming Li · MSc Data Science and Machine Learning, UCL · ucabq07@ucl.ac.uk
 
 ## Licence
 
