@@ -31,7 +31,7 @@ import filter_config as fc
 SR = config.SAMPLE_RATE
 SEG = config.SEGMENT_SAMPLES           # 16000
 # 数据源可指向 ext4 本地副本（drvfs 上逐文件读取是 10x 慢的瓶颈）
-#   export SAFESOUND_SRC_DIR=/root/safesound_src
+#   export SAFESOUND_SRC_DIR=/path/to/raw_corpora
 SRC = Path(os.environ.get("SAFESOUND_SRC_DIR", str(config.RAW_DATA)))
 USD8K_ROOT = config.RAW_DATA / "UrbanSound8K"
 ESC50_ROOT = config.RAW_DATA / "ESC-50-master"

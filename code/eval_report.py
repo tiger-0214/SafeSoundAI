@@ -12,7 +12,7 @@ SafeSoundAI — AED 模块评估报告（eval_report.py）
   6. 报告：outputs/reports/aed_eval.md
 
 运行：
-  export SAFESOUND_DATA_DIR=/root/safesound_data
+  export SAFESOUND_DATA_DIR=/path/to/preprocessed_data
   python3 eval_report.py                 # 全量 test fold 9
   python3 eval_report.py --limit 800     # 快速自检
 """

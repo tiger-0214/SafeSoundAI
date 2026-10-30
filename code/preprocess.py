@@ -15,7 +15,7 @@ SafeSoundAI — Trigger-AED v2 预处理（4 触发类 + 背景）
     → float32 .npy 落盘 → 近似去重 → 录音级分组切分（8/1/1）
 
 用法：
-    export SAFESOUND_DATA_DIR=/root/safesound_data
+    export SAFESOUND_DATA_DIR=/path/to/preprocessed_data
     python preprocess.py                     # 全流程
     python preprocess.py --skip-fsd50k       # 只用已有 urban/esc50 段
     python preprocess.py --with-explosion    # 把 FSD50K Explosion/Boom 并入 gun_shot

@@ -8,7 +8,7 @@ SafeSoundAI — Trigger-AED v2 训练（5 类：4 触发 + background）
     4. 温度标定（val 上拟合）后报 ECE
 
 运行：
-    export SAFESOUND_DATA_DIR=/root/safesound_data
+    export SAFESOUND_DATA_DIR=/path/to/preprocessed_data
     python train_dscnn.py --epochs 30
     python train_dscnn.py --cross-corpus fsd50k      # 训练集剔除 fsd50k，fsd50k 全部当外部测试
     python train_dscnn.py --epochs 2 --limit 2000    # 冒烟

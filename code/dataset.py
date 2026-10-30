@@ -4,7 +4,7 @@ SafeSoundAI — PyTorch 数据集（dataset.py）
 从 metadata_clean.csv 加载 .npy 片段，按 cv_fold 划分 train/val/test，
 在线计算 log-Mel，训练时可选噪声混合 + SpecAugment。
 
-⚠️ 必须先运行 build_metadata.py 生成 metadata_clean.csv。
+⚠️ 需要 metadata_clean.csv（由 preprocess.py 产出）。
 """
 from __future__ import annotations
 

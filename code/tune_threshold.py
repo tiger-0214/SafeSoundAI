@@ -13,7 +13,7 @@ siren 漏检 17.3%（1,486 段里 257 段被判成 background），precision 却
 产出：outputs/reports/threshold_policy_4cls.{md,json} + figures/fig_threshold_siren_4cls.png
 
 用法：
-    export SAFESOUND_DATA_DIR=/root/safesound_data
+    export SAFESOUND_DATA_DIR=/path/to/preprocessed_data
     python3 tune_threshold.py --ckpt ../outputs/models/dscnn_v2_4cls.pt
 """
 from __future__ import annotations

@@ -11,7 +11,7 @@ SafeSoundAI — Trigger-AED v2 数据审计
     E. 不平衡   最大类 / 最小类 比值；建议训练期处理方式
 
 用法:
-    export SAFESOUND_DATA_DIR=/root/safesound_data
+    export SAFESOUND_DATA_DIR=/path/to/preprocessed_data
     python data_audit.py
 """
 from __future__ import annotations

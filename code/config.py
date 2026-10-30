@@ -18,10 +18,10 @@ WORKSPACE = CODE_DIR.parent                                # 0-SafeSound AI work
 RAW_DATA = WORKSPACE / "1_Original_Database"
 
 # 数据目录可被环境变量覆盖（用于把数据放到 WSL 本地盘加速 IO）：
-#   export SAFESOUND_DATA_DIR=/root/safesound_data
+#   export SAFESOUND_DATA_DIR=/path/to/preprocessed_data
 PREPROCESSED = Path(os.environ.get("SAFESOUND_DATA_DIR", WORKSPACE / "2_Preprocessed_Data"))
 
-# 原始 metadata（1.1 已产出，但 npy_path 为旧绝对路径，需 build_metadata.py 修复）
+# 原始 metadata（npy_path 为绝对路径，跨机器使用需重建）
 METADATA_RAW = PREPROCESSED / "metadata.csv"
 # 修复 + 映射 + 划分后的干净 metadata（训练唯一数据源）
 METADATA_CLEAN = PREPROCESSED / "metadata_clean.csv"

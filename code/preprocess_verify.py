@@ -20,6 +20,8 @@ SafeSoundAI — 预处理完整性二次核验（preprocess_verify.py）
 """
 from __future__ import annotations
 
+import os
+
 import hashlib
 import json
 from collections import Counter
@@ -46,16 +48,19 @@ DANGER = [c for c, r in config.SAFETY_ROLE.items() if r == "danger"]
 
 
 def localize(path: str) -> Path:
-    """把 /mnt/d 路径映射到 ext4 副本（存在则优先），避免慢盘 IO。"""
+    """把外部挂载路径映射到 SAFESOUND_DATA_DIR 下的同一相对位置（存在则优先）。"""
     p = Path(path)
     if p.exists():
         return p
-    marker = "2_Preprocessed_Data/"
     s = str(p)
-    if marker in s:
-        alt = Path("/root/safesound_data") / s.split(marker, 1)[1]
-        if alt.exists():
-            return alt
+    for marker in ("2_Preprocessed_Data/", "preprocessed_data/"):
+        if marker in s:
+            rel = s.split(marker, 1)[1]
+            for root in (os.environ.get("SAFESOUND_DATA_DIR"),):
+                if root:
+                    alt = Path(root) / rel
+                    if alt.exists():
+                        return alt
     return p
 
 
@@ -259,7 +264,7 @@ def main() -> None:
               f"{(str(round(v1_stat['ratio']*100,1)) + '%') if v1_stat else 'n/a'} 的段所属录音在训练集中出现过。",
               "- **v2（现行）**：`recording_group()` 按 fsID 分组 + 贪心装箱分层，"
               "10 折每折 5,763–6,086 段、最小类-折 115 段，文件级/录音级/波形级泄漏全部为 0。",
-              "- 复现旧结果：`python3 build_metadata.py --file-level`。"]
+              "- 检查点路径可被 SAFESOUND_DATA_DIR 覆盖。"]
     lines += ["", "## 五、与预期任务的差距（真实结论）", ""]
     gaps = []
     if any(c["项"] == "P4" and c["结果"] == "FAIL" for c in checks):

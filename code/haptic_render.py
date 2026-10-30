@@ -3,7 +3,7 @@ SafeSoundAI — v3 触觉模式渲染器（haptic_render.py）
 
 把 HapticPattern 渲染成"能听出来的震动"：175 Hz LRA 载波 × 震动包络 × 幅度。
 
-⚠️ 关键约束（旧 demo_haptic_audio.render() 的 bug 就在这里）：
+⚠️ 关键约束（早前版本在这一点上出过错）：
    **不能做峰值归一化**。旧版 `0.95 * y / max|y|` 会把 40/70/100% 三档压成同一响度，
    幅度轴的信息被抹掉，实验做出来必然"三档不可分"。
    本模块固定满刻度参考（FULL_SCALE），幅度信息完整保留。
