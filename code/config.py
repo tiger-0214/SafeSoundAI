@@ -33,7 +33,15 @@ MODEL_DIR = OUTPUT_DIR / "models"
 LOG_DIR = OUTPUT_DIR / "logs"
 
 # ---------------------------------------------------------------------------
-# 10 目标类（= UrbanSound8K 的 10 类，class_id 直接复用 0-9）
+# 类别词表（class_id 空间）
+#
+# 本文件定义的是 **10 类词表**（= UrbanSound8K 的 10 类，class_id 直接复用 0-9），
+# 供降噪支路（filter_config / attenuator / filter_pipeline）与 TSE 条件输入使用。
+#
+# ⚠️ 检测模型（AED）不依赖本表：训练脚本自带 CLASSES_V2，检查点文件里存有
+#    `classes` 字段（4 类：siren / car_horn / gun_shot / background）。
+#    任何需要"class_id → 类名"的地方，都要从**检查点的 classes** 取值，
+#    不要用 TARGET_CLASSES 索引 4 类模型的输出，否则类名会错位。
 # ---------------------------------------------------------------------------
 TARGET_CLASSES = [
     "air_conditioner",   # 0  🟢 背景（常被误判）

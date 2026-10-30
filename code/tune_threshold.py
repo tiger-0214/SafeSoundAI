@@ -1,5 +1,5 @@
 """
-SafeSoundAI — Trigger-AED v2 决策层阈值策略（tune_threshold_v2.py）
+SafeSoundAI — Trigger-AED v2 决策层阈值策略（tune_threshold.py）
 ==================================================================
 4 类基线（siren / car_horn / gun_shot / background）在 argmax 口径下
 siren 漏检 17.3%（1,486 段里 257 段被判成 background），precision 却有 0.925
@@ -14,7 +14,7 @@ siren 漏检 17.3%（1,486 段里 257 段被判成 background），precision 却
 
 用法：
     export SAFESOUND_DATA_DIR=/root/safesound_data
-    python3 tune_threshold_v2.py --ckpt ../outputs/models/dscnn_v2_4cls.pt
+    python3 tune_threshold.py --ckpt ../outputs/models/dscnn_v2_4cls.pt
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 import config
 import viz_style as vs
 from models import DS_CNN
-import train_dscnn_v2 as T2
+import train_dscnn as T2
 
 REP, FIG = vs.REPORT_DIR, vs.FIG_DIR
 DATA_V2 = config.PREPROCESSED / "trigger_v2"

@@ -16,9 +16,9 @@ SafeSoundAI — Trigger-AED v2 预处理（4 触发类 + 背景）
 
 用法：
     export SAFESOUND_DATA_DIR=/root/safesound_data
-    python preprocess_v2.py                     # 全流程
-    python preprocess_v2.py --skip-fsd50k       # 只用已有 urban/esc50 段
-    python preprocess_v2.py --with-explosion    # 把 FSD50K Explosion/Boom 并入 gun_shot
+    python preprocess.py                     # 全流程
+    python preprocess.py --skip-fsd50k       # 只用已有 urban/esc50 段
+    python preprocess.py --with-explosion    # 把 FSD50K Explosion/Boom 并入 gun_shot
 """
 from __future__ import annotations
 
@@ -473,7 +473,7 @@ def main() -> None:
         "per_split": out.split.value_counts().to_dict(),
         "elapsed_s": round(time.time() - t0, 1),
     }
-    (DATA_V2 / "preprocess_v2_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2))
+    (DATA_V2 / "preprocess_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

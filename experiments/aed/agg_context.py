@@ -129,7 +129,7 @@ def main():
     taus = np.arange(0.2, 0.81, 0.05)
 
     def evaluate_version(p4_va, p4_te, tag):
-        """阈值只在 val 上选，原样搬到 test（与 final_v3 同纪律）。"""
+        """阈值只在 val 上选，原样搬到 test（与 run 同纪律）。"""
         yv, yt = y[va], y[te]
         cands = [(headline_from(p4_va, yv, t)[:2], t) for t in taus]
         (acc_v, f1_v), tau = max(cands, key=lambda r: r[0][0] + r[0][1])

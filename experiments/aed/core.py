@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 import math
 from pathlib import Path
 
@@ -27,11 +28,12 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 SR = 16000
 SEG = 16000
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
-EXP = Path("/root/clacky_workspace/safesound_exp")
+EXP = Path(os.environ.get("SAFESOUND_EXP_DIR", "outputs/exp"))
 V3 = EXP / "v3"
-V3.mkdir(exist_ok=True)
-META_V2 = Path("/root/safesound_data/trigger_v2/metadata_v2.csv")
-META_ALL = Path("/root/safesound_data/metadata_clean.csv")
+V3.mkdir(parents=True, exist_ok=True)
+DATA = Path(os.environ.get("SAFESOUND_DATA_DIR", "preprocessed_data"))
+META_V2 = DATA / "trigger_v2" / "metadata_v2.csv"
+META_ALL = DATA / "metadata_clean.csv"
 
 ALARMS = ["siren", "car_horn", "gun_shot", "fireworks"]
 BASE5 = ALARMS + ["background"]

@@ -29,7 +29,6 @@ figs/
 *.mp4
 *.gif
 *.png
-!docs/**/*.png
 
 # --- editor / os ---
 .obsidian/

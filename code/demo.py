@@ -10,13 +10,13 @@ One command, no dataset required, no plotting. Runs the whole MVP loop:
 Usage
 -----
     # 1) built-in synthetic street scene (12 s, assembled from the fold-9 test set)
-    python3 demo_v3.py
+    python3 demo.py
 
     # 2) your own recording (resampled to 16 kHz mono)
-    python3 demo_v3.py --wav street.wav
+    python3 demo.py --wav street.wav
 
     # 3) a single preprocessed 1-s segment (.npy, already z-scored)
-    python3 demo_v3.py --npy seg.npy
+    python3 demo.py --npy seg.npy
 
 Notes
 -----

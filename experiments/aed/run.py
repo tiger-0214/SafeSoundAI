@@ -6,7 +6,7 @@
   3) 拒识：未见 15 类 unknown（10 benign / 5 hazard）上的 AUROC 与误报率
   4) 标定：温度缩放前后 ECE
 
-用法：python3 final_v3.py --cfg ml_v3 [--seeds 42,43,44] [--epochs 25]
+用法：python3 run.py --cfg ml_v3 [--seeds 42,43,44] [--epochs 25]
 """
 import argparse
 import json
