@@ -5,14 +5,17 @@ SafeSoundAI — 方案 A：AED 驱动谱增益门（attenuator.py, A2.2）
     STFT → Mel → DS_CNN(AED) → 类后验 → 类增益软混合（频带加权）→ 限幅/平滑
          → 线性频域掩码 → 复数谱乘法 → iSTFT
 
-设计要点：
-  * 不做逐窗 z-score（流式一致性），只做单次全局 RMS 归一化后再还原增益；
+设计要点（2026-10-31 修订，依据真实混合集实测，见 reports/filter_ab_report.md）：
+  * **逐窗 z-score**：训练段是 z-score 过的，推理不做同样归一化会让 AED 后验整体错位
+    （200 条真实混合上 top-1 从 0.17 回升到 0.53）。开关 `fc.ZSCORE_WINDOWS`。
   * 类增益按「该类能量谱形」加权，避免全频段一刀切把同频段警报声一起压掉；
-  * 内置硬门校验（白名单衰减 > 3 dB → 该窗直通）与能量塌陷保护（filter_safety §二）。
+  * 白名单保护从「整窗否决」改为「频谱让位」：只在白名单类的能量带内把增益抬回
+    ≈0 dB，其余频段照常衰减。开关 `fc.WHITELIST_CARVEOUT`。
+  * 语义一律经 `vocab` 翻译到**当前检查点自己的类别空间**，不再硬编码 10 类 id。
 
 用法：
-    python attenuator.py --audio outputs/audio/02_children_playing.wav --out /tmp/f.wav
-    python attenuator.py --demo-set            # 处理 outputs/audio 下全部 demo 音频
+    python attenuator.py --audio in.wav --out /tmp/f.wav
+    python attenuator.py --demo-set --ckpt outputs/models/ds_cnn_best.pth
 """
 from __future__ import annotations
 
@@ -30,9 +33,9 @@ import torchaudio
 
 import config
 import filter_config as fc
+import vocab
 from audio_utils import load_and_resample
 from mel import get_mel_transform
-from models import DS_CNN
 
 warnings.filterwarnings('ignore', message='At least one mel filterbank')
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -101,33 +104,52 @@ class SpectralGateAttenuator:
                  device: torch.device = DEVICE,
                  smooth_alpha: float = fc.SMOOTH_ALPHA,
                  use_class_bands: bool = True,
-                 apply_conf: float = fc.APPLY_CONF_THRESHOLD):
+                 apply_conf: float = fc.APPLY_CONF_THRESHOLD,
+                 zscore_windows: bool | None = None,
+                 carveout: bool | None = None,
+                 strength: float | None = None,
+                 noise_conditional: bool | None = None):
         self.profile = fc.get_profile(profile)
-        self.gains = {int(k): float(v) for k, v in self.profile["gains"].items()}
+        self.profile_name = profile
         self.max_att = float(self.profile["max_total_attenuation_db"])
         self.device = device
         self.smooth_alpha = smooth_alpha
         self.use_class_bands = use_class_bands
-        # 置信度门控：只有 p ≥ apply_conf 的类别才参与增益叠加。
-        # 理由（实测）：当前 AED 对 11 条 demo 里 8 条输出 car_horn≈0.6-0.7，
-        # 警笛被判成 jackhammer 0.40。若用全类软混合，模糊后验会把警笛压掉 6 dB。
-        # 改进后：判不准 = 不衰减（fail-open），安全优先。
         self.apply_conf = float(apply_conf)
+        self.zscore = fc.ZSCORE_WINDOWS if zscore_windows is None else bool(zscore_windows)
+        self.carveout = fc.WHITELIST_CARVEOUT if carveout is None else bool(carveout)
+        self.strength = float(fc.GAIN_STRENGTH if strength is None else strength)
+        self.noise_cond = (fc.NOISE_CONDITIONAL_GAIN if noise_conditional is None
+                           else bool(noise_conditional))
         self.stats = {"silent_suppression_events": 0, "over_suppression_events": 0,
-                      "frames": 0, "hard_gate_windows": 0, "pass_frames": 0}
+                      "frames": 0, "hard_gate_windows": 0, "pass_frames": 0,
+                      "carveout_frames": 0}
 
-        self.model = DS_CNN().to(device)
-        ckpt = Path(aed_ckpt or (config.MODEL_DIR / "ds_cnn_best.pth"))
-        self.model.load_state_dict(torch.load(ckpt, map_location=device))
-        self.model.eval()
+        # ---- AED 头：类名 / 类数 / mel 参数全部由检查点决定（vocab 是唯一入口）----
+        self.head = vocab.load_aed(aed_ckpt, device=device)
+        self.classes: list[str] = list(self.head.classes)
+        self.n_classes = self.head.n_classes
+        self.mel_tf = self.head.mel_transform().to(device)
+        self.frames = int(self.head.mel["frames"])
+        # 语义表按名字翻译到本头空间（白名单类永久 0 dB，未知类 fail-open 0 dB）
+        self.gains: dict[int, float] = fc.gains_for(self.classes, profile)
+        self.whitelist_ids = fc.whitelist_ids_in(self.classes)
+        self.noise_ids = [i for i in range(self.n_classes) if i not in self.whitelist_ids]
+        self.model = self.head.model
 
         prof = build_class_profiles()
-        self.class_band = np.zeros((config.NUM_CLASSES, config.N_MELS), dtype=np.float32)
-        for cid in range(config.NUM_CLASSES):
-            if cid in prof:
-                self.class_band[cid] = np.array(prof[cid], dtype=np.float32)
-
-        self.mel_tf = get_mel_transform().to(device)
+        self.class_band = np.zeros((self.n_classes, config.N_MELS), dtype=np.float32)
+        noise_ref = [band for cid, band in prof.items()
+                     if cid < len(vocab.SOURCE_CLASSES)
+                     and vocab.role_of(vocab.SOURCE_CLASSES[cid]) == "noise"]
+        for cid, name in enumerate(self.classes):
+            src = config.CLASS_TO_IDX.get(name)
+            if src is not None and src in prof:
+                self.class_band[cid] = np.array(prof[src], dtype=np.float32)
+            elif noise_ref:                        # 如 4 类头的 background：取噪声类均值
+                self.class_band[cid] = np.mean(np.stack(noise_ref), axis=0)
+            else:
+                self.class_band[cid] = 1.0
 
     # -- AED 后验：按 1 s 窗批量推理（L3 过渡方案，见 filter_constraints §三） --
     @torch.no_grad()
@@ -137,22 +159,24 @@ class SpectralGateAttenuator:
             y = np.pad(y, (0, seg - len(y)))
         starts = list(range(0, max(1, len(y) - seg + 1), hop))
         wins = np.stack([y[s:s + seg] for s in starts]).astype(np.float32)
+        if self.zscore:                            # ← 与训练口径一致（核心修复）
+            wins = (wins - wins.mean(axis=1, keepdims=True)) / (wins.std(axis=1, keepdims=True) + 1e-8)
         logits = []
         for i in range(0, len(wins), 32):
             batch = torch.from_numpy(wins[i:i + 32]).to(self.device)   # (B, 16000)
             mel = torch.stack([self.mel_tf(b) for b in batch])         # (B, n_mels, T')
-            mel = torch.log(mel + 1e-9)[:, None, :, :config.FRAMES]
-            if mel.shape[-1] < config.FRAMES:
-                mel = F.pad(mel, (0, config.FRAMES - mel.shape[-1]))
+            mel = torch.log(mel + 1e-9)[:, None, :, :self.frames]
+            if mel.shape[-1] < self.frames:
+                mel = F.pad(mel, (0, self.frames - mel.shape[-1]))
             logits.append(self.model(mel))
         probs = F.softmax(torch.cat(logits), dim=1).cpu().numpy()
-        return probs, starts                                      # (n_win, 10)
+        return probs, starts                                      # (n_win, n_classes)
 
     def frame_probs(self, y: np.ndarray) -> np.ndarray:
         """把窗口级后验上采样到 STFT 帧级（重叠窗取平均）。"""
         probs, starts = self.window_probs(y)
         n_frames = 1 + len(y) // fc.FILTER_HOP
-        acc = np.zeros((n_frames, config.NUM_CLASSES), dtype=np.float32)
+        acc = np.zeros((n_frames, self.n_classes), dtype=np.float32)
         cnt = np.zeros((n_frames, 1), dtype=np.float32)
         win_frames = config.SEGMENT_SAMPLES // fc.FILTER_HOP     # 100
         for wi, s in enumerate(starts):
@@ -164,34 +188,57 @@ class SpectralGateAttenuator:
             cnt[f0:f1] += 1.0
         return acc / np.maximum(cnt, 1.0)
 
-    # -- 增益曲线：类软混合 + 频带加权 + 限幅 + 平滑 --
+    # -- 增益曲线：类软混合 + 频带加权 + 白名单让位 + 限幅 + 平滑 --
     def gain_curve_db(self, probs_frames: np.ndarray) -> np.ndarray:
         """
-        probs_frames : (T, 10)
+        probs_frames : (T, n_classes)
         返回 (n_mels, T) 的 dB 增益
 
-        置信度门控版加权：w_c ∝ exp(p_c/τ) · 1[p_c ≥ apply_conf]。
+        置信度门控加权：w_c ∝ exp(p_c/τ) · 1[p_c ≥ apply_conf]。
         整帧没有任何类别达到阈值 → 权重全 0 → 增益 0 dB（直通）。
+        白名单让位（carveout）：按 p_白名单 逐频带把增益抬回 ≈0 dB。
         """
         T = probs_frames.shape[0]
+        raw = probs_frames                                   # 绝对后验（白名单让位用）
+        if self.noise_cond and self.noise_ids:
+            probs_frames = probs_frames.copy()
+            mask_ids = np.array(self.noise_ids, dtype=int)
+            sub = probs_frames[:, mask_ids]
+            ssum = sub.sum(axis=1, keepdims=True)
+            keep = np.zeros_like(probs_frames)
+            keep[:, mask_ids] = np.where(ssum > 1e-6, sub / np.maximum(ssum, 1e-9), 0.0)
+            probs_frames = keep
         conf = (probs_frames >= self.apply_conf).astype(np.float32)
         w = np.exp(probs_frames / fc.SOFTMAX_TEMPERATURE) * conf
         denom = np.maximum(w.sum(axis=1, keepdims=True), 1e-9)
-        w = np.where(w.sum(axis=1, keepdims=True) > 0, w / denom, 0.0)   # (T, 10)
+        w = np.where(w.sum(axis=1, keepdims=True) > 0, w / denom, 0.0)   # (T, n_classes)
         self.stats["pass_frames"] += int((w.sum(axis=1) == 0).sum())
 
         g_db = np.zeros((config.N_MELS, T), dtype=np.float32)
-        for cid in range(config.NUM_CLASSES):
+        for cid in range(self.n_classes):
             target = self.gains.get(cid, 0.0)
             if abs(target) < 1e-6:
                 continue
             if self.use_class_bands:
-                band = self.class_band[cid][:, None]                 # (128,1)
+                band = self.class_band[cid][:, None]                 # (n_mels,1)
             else:
                 band = np.ones((config.N_MELS, 1), dtype=np.float32)
             g_db += (w[:, cid][None, :] * target) * band             # 能量带加权
 
+        if self.carveout:
+            # 让位强度 = 白名单类的逐帧置信度 × 该类能量带（只让出该类的频谱，不否决整帧）
+            protect = np.zeros((config.N_MELS, T), dtype=np.float32)
+            for cid in self.whitelist_ids:
+                protect = np.maximum(protect,
+                                     self.class_band[cid][:, None] * raw[:, cid][None, :])
+            self.stats["carveout_frames"] += int((protect.max(axis=0) > 0.5).sum())
+            g_db *= (1.0 - np.clip(protect, 0.0, 1.0))
+            # 硬底线：白名单能量带内衰减不得深于 CARVEOUT_GUARD_DB
+            g_db = np.where(protect >= 0.5, np.maximum(g_db, fc.CARVEOUT_GUARD_DB), g_db)
+
         np.clip(g_db, max(fc.GAIN_CLAMP_DB[0], -self.max_att), fc.GAIN_CLAMP_DB[1], out=g_db)
+        if self.strength != 1.0:                 # 安全强度：向 0 dB 收缩
+            g_db *= self.strength
         # 跨帧一阶平滑 + 跳变限制
         sm = np.empty_like(g_db)
         prev = g_db[:, 0]
@@ -202,22 +249,36 @@ class SpectralGateAttenuator:
             sm[:, t] = prev
         return sm
 
-    # -- 硬门：白名单类衰减 >3 dB 且置信度高 → 该窗直通（filter_safety §2.1） --
+    # -- 硬门（保守模式）：白名单类极高置信 → 该窗直通（filter_safety §2.1） --
     def hard_gate_mask(self, probs_frames: np.ndarray) -> np.ndarray:
-        """返回 (T,) bool，True = 允许施加增益。"""
+        """返回 (T,) bool，True = 允许施加增益。
+
+        carveout 模式下只剩「极高置信白名单」才整窗否决；旧的全量否决逻辑
+        （p>0.5 即直通）在真实混合上会把 80% 的帧放空，实测见报告 §三。
+        """
         allow = np.ones(probs_frames.shape[0], dtype=bool)
-        for cid in fc.WHITELIST_IDS:
-            strong = probs_frames[:, cid] > 0.5
-            # 白名单类目标增益为 0 → 只有被软混合"误伤"才需要门控
-            allow &= ~strong | (probs_frames[:, cid] < 0.0)
+        if self.carveout:
+            thr = fc.WHITELIST_VETO_CONF
+            for cid in self.whitelist_ids:
+                allow &= probs_frames[:, cid] < thr
+        else:
+            for cid in self.whitelist_ids:
+                allow &= probs_frames[:, cid] < 0.5
         return allow
 
     def _resolve_probs(self, y: np.ndarray, oracle_class: int | None = None) -> np.ndarray:
-        """取 AED 后验；oracle_class 不为空时用真值 one-hot 替换（评测上界用）。"""
+        """取 AED 后验；oracle_class 不为空时用真值 one-hot 替换（评测上界用）。
+
+        oracle_class 是**源类空间（10 类）** id，这里经 vocab 桥接进本头空间；
+        桥接不到（4 类头没有该类）时退回「全零 → fail-open 不衰减」。
+        """
         probs = self.frame_probs(y)
         if oracle_class is not None:
             probs = np.zeros_like(probs)
-            probs[:, int(oracle_class)] = 1.0
+            hid = vocab.source_to_bridge(int(oracle_class), self.classes)
+            if hid is None:
+                hid = self.classes.index("background") if "background" in self.classes else 0
+            probs[:, hid] = 1.0
         return probs
 
     # -- 端到端处理 --
@@ -257,8 +318,10 @@ class SpectralGateAttenuator:
             y_out = y.copy()
 
         self.stats["frames"] += int(T)
-        info = {"probs_top": int(np.argmax(probs.mean(axis=0))),
-                "top_name": config.TARGET_CLASSES[int(np.argmax(probs.mean(axis=0)))],
+        top_i = int(np.argmax(probs.mean(axis=0)))
+        info = {"probs_top": top_i,
+                "top_name": self.classes[top_i],           # ← 本头自己的类名，不再反查 10 类表
+                "top_prob": round(float(probs.mean(axis=0)[top_i]), 3),
                 "energy_delta_db": round(float(delta_db), 2),
                 "applied": bool(delta_db >= fc.ANTI_COLLAPSE_DB)}
         return y_out, info
@@ -294,9 +357,16 @@ def main() -> None:
     ap.add_argument("--profile", type=str, default=fc.DEFAULT_PROFILE)
     ap.add_argument("--ckpt", type=str, default=None)
     ap.add_argument("--demo-set", action="store_true", help="批量处理 outputs/audio/*.wav")
+    ap.add_argument("--no-zscore", action="store_true", help="关闭逐窗 z-score（消融用）")
+    ap.add_argument("--no-carveout", action="store_true", help="回退整窗否决式白名单保护（消融用）")
     args = ap.parse_args()
 
-    att = SpectralGateAttenuator(profile=args.profile, aed_ckpt=args.ckpt)
+    att = SpectralGateAttenuator(profile=args.profile, aed_ckpt=args.ckpt,
+                                 zscore_windows=not args.no_zscore,
+                                 carveout=not args.no_carveout)
+    print(f"AED 头: {vocab.describe(att.head)}")
+    print(f"模式: zscore={att.zscore} carveout={att.carveout} "
+          f"gains={ {att.classes[i]: g for i, g in att.gains.items()} }")
     fc.FILTER_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
     targets: list[Path] = []
@@ -314,8 +384,8 @@ def main() -> None:
         out = Path(args.out) if (args.out and not args.demo_set) else \
             fc.FILTER_AUDIO_DIR / f"filtered_{p.stem}.wav"
         sf.write(out, y_out, config.SAMPLE_RATE, subtype="PCM_16")
-        print(f"{p.name}: top={info['top_name']:<16} Δ能量={info['energy_delta_db']:>7.2f} dB "
-              f"→ {out.name}")
+        print(f"{p.name}: top={info['top_name']}({info['top_prob']:.2f}) "
+              f"Δ能量={info['energy_delta_db']:>7.2f} dB applied={info['applied']} → {out.name}")
 
     print("\n统计:", json.dumps(att.stats, ensure_ascii=False))
 

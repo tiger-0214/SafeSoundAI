@@ -22,54 +22,98 @@ import config
 # ---------------------------------------------------------------------------
 NAME_TO_ID = {name: i for i, name in enumerate(config.TARGET_CLASSES)}
 
-# 白名单：永不抑制（安全关键）
-WHITELIST = {8: 0.0, 1: 0.0, 6: 0.0, 3: 0.0}          # siren, car_horn, gun_shot, dog_bark
-# 黑名单：默认抑制，用户可调
-BLACKLIST = {0: -12.0, 9: -12.0, 5: -6.0, 7: -6.0, 4: -6.0}
-# 中性：不主动处理
-NEUTRAL = {2: 0.0}                                     # children_playing
+# --- 唯一真相：语义表用**类名**表达（2026-10-31 起） --------------------------
+# 历史教训：旧版把白/黑名单写死成 10 类 class_id，一旦换成 4 类 AED 头
+# （0=siren,1=car_horn,2=gun_shot,3=background）索引全部错位，
+# 警笛会被打上 air_conditioner 的 -12 dB 增益。故所有语义一律按名字声明，
+# 由 gains_for(classes) 在运行时翻译到**当前头自己的空间**。
+WHITELIST_NAMES = {                                   # 永不抑制（安全关键）
+    "siren": 0.0, "car_horn": 0.0, "gun_shot": 0.0, "dog_bark": 0.0,
+}
+BLACKLIST_NAMES = {                                   # 默认抑制，用户可调
+    "air_conditioner": -12.0, "street_music": -12.0,
+    "drilling": -6.0, "jackhammer": -6.0, "engine_idling": -6.0,
+}
+NEUTRAL_NAMES = {"children_playing": 0.0}              # 中性：不主动处理
+
+# 源类空间（10 类）下的 id 版本 —— 过滤支路内部仍用 10 类坐标
+WHITELIST = {NAME_TO_ID[n]: g for n, g in WHITELIST_NAMES.items() if n in NAME_TO_ID}
+BLACKLIST = {NAME_TO_ID[n]: g for n, g in BLACKLIST_NAMES.items() if n in NAME_TO_ID}
+NEUTRAL = {NAME_TO_ID[n]: g for n, g in NEUTRAL_NAMES.items() if n in NAME_TO_ID}
 
 ALL_IDS = set(range(config.NUM_CLASSES))
 WHITELIST_IDS = frozenset(WHITELIST)
 BLACKLIST_IDS = frozenset(BLACKLIST)
 NEUTRAL_IDS = frozenset(NEUTRAL)
 
-# 档位预设（filter_spec.md §2.4）
-PROFILE_PRESETS = {
+# 档位预设（filter_spec.md §2.4）—— 同样按**类名**声明，再翻译成 10 类 id 版
+_PROFILE_NAMES = {
     "comfort": {
         "profile_id": "comfort",
-        "gains": {**{k: 0.0 for k in WHITELIST},
-                  **{k: -18.0 for k in BLACKLIST},
-                  **{k: 0.0 for k in NEUTRAL}},
+        "gains": {**WHITELIST_NAMES, **{n: -18.0 for n in BLACKLIST_NAMES}, **NEUTRAL_NAMES},
         "enhance_whitelist_db": 0.0,
         "max_total_attenuation_db": 24.0,
     },
     "ptsd_default": {
         "profile_id": "ptsd_default",
-        "gains": {**WHITELIST, **BLACKLIST, **NEUTRAL},
+        "gains": {**WHITELIST_NAMES, **BLACKLIST_NAMES, **NEUTRAL_NAMES},
         "enhance_whitelist_db": 0.0,
         "max_total_attenuation_db": 24.0,
     },
     "awareness": {
         "profile_id": "awareness",
-        "gains": {**{k: 3.0 for k in WHITELIST},
-                  **{0: -6.0, 9: -6.0, 5: 0.0, 7: 0.0, 4: 0.0},
-                  **NEUTRAL},
+        "gains": {**{n: 3.0 for n in WHITELIST_NAMES},
+                  "air_conditioner": -6.0, "street_music": -6.0,
+                  "drilling": 0.0, "jackhammer": 0.0, "engine_idling": 0.0,
+                  **NEUTRAL_NAMES},
         "enhance_whitelist_db": 3.0,
         "max_total_attenuation_db": 12.0,
     },
 }
+
+
+def _to_ids(profile: dict) -> dict:
+    """名字版档位 → 10 类源空间 id 版（保持向后兼容）。"""
+    p = dict(profile)
+    p["gains"] = {NAME_TO_ID[n]: g for n, g in profile["gains"].items() if n in NAME_TO_ID}
+    return p
+
+
+PROFILE_PRESETS = {k: _to_ids(v) for k, v in _PROFILE_NAMES.items()}
 DEFAULT_PROFILE = "ptsd_default"
 
 
 def get_profile(name: str | None = None) -> dict:
-    """返回档位配置（未知名字回退默认档）。"""
+    """返回档位配置（未知名字回退默认档）。gain 的 key 为 10 类源空间 id。"""
     return PROFILE_PRESETS.get(name or DEFAULT_PROFILE, PROFILE_PRESETS[DEFAULT_PROFILE])
 
 
+def get_profile_names(name: str | None = None) -> dict:
+    """返回名字版档位配置（`gains` 的 key 是类名）。"""
+    return _PROFILE_NAMES.get(name or DEFAULT_PROFILE, _PROFILE_NAMES[DEFAULT_PROFILE])
+
+
 def class_gains(profile: str | None = None) -> dict[int, float]:
-    """class_id → 目标增益 dB。"""
+    """class_id → 目标增益 dB（10 类源空间）。"""
     return dict(get_profile(profile)["gains"])
+
+
+def gains_for(classes: list[str] | tuple[str, ...], profile: str | None = None) -> dict[int, float]:
+    """把档位增益翻译到**任意 AED 头空间**：返回 {该头空间的 class_id: dB}。
+
+    * 语义表里有该类 → 取该档位增益；
+    * 语义表里没有（最典型是 4 类头的 ``background``）→ **0 dB**，即
+      「该头分不清的类别一律不衰减」（fail-open）。理由：4 类头的 background
+      同时装了空调/电钻/狗叫/儿童嬉闹，对它下负增益必然误伤安全类，
+      宁可交给 10 类头去区分。详见 reports/filter_ab_report.md §二。
+    """
+    by_name = get_profile_names(profile)["gains"]
+    return {i: float(by_name.get(n, 0.0)) for i, n in enumerate(classes)}
+
+
+def whitelist_ids_in(classes: list[str] | tuple[str, ...]) -> frozenset[int]:
+    """当前头空间里属于白名单的 class_id 集合。"""
+    return frozenset(i for i, n in enumerate(classes) if n in WHITELIST_NAMES)
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +152,26 @@ GAIN_CLAMP_DB = (-30.0, 6.0)
 ANTI_COLLAPSE_DB = -20.0                        # 整体能量塌陷阈值（filter_safety §2.2）
 HARD_GATE_TOLERANCE_DB = -3.0                   # 白名单允许的最大衰减（filter_safety §2.1）
 SOFTMAX_TEMPERATURE = 0.7
+
+# --- 2026-10-31 修复项（真实混合集实测驱动，见 reports/filter_ab_report.md）------
+# 1) 逐窗 z-score：训练用的段是 z-score 过的，推理不做同样归一化 → 分布错位。
+#    实测（200 条真实混合）top-1：不归一化 0.17 vs 逐窗 z-score 0.53。
+ZSCORE_WINDOWS = True
+# 2) 白名单「频谱让位」而非「整窗否决」：旧逻辑只要某个白名单类 p>0.5 就整窗直通，
+#    而误判恰好大量流向 car_horn / siren，导致该降噪时反而全程不降噪。
+#    新逻辑：仍施加噪声增益，但把该白名单类的能量带抬回 0 dB（只让出频谱，不让出整帧）。
+WHITELIST_CARVEOUT = True
+CARVEOUT_GUARD_DB = -1.0                        # 让位后该类频带允许的最大衰减
+WHITELIST_VETO_CONF = 0.85                      # 仅当白名单类极高置信时才整窗直通
+# 3) 安全强度 α（与 TSE 同思路）：g_eff = α·g。α 越小越保守、白名单红线越容易守住。
+#    实测（30 条真实混合）：α=1.0 → Supp -2.9 / Pres -2.4（红线 27% 样本超标）；
+#    调小 α 会等比例缩水抑制与误伤，选择性 gap 不变（见 reports/filter_ablation.md）。
+GAIN_STRENGTH = 1.0
+# 4) 噪声子词表归一化：衰减权重在「非白名单类」内部归一化，白名单保护仍用**绝对**后验。
+#    动机：37% 的真实混合窗口 argmax 落在白名单类（多数是噪声被误判成 car_horn），
+#    若衰减权重也用绝对后验，这些窗口完全不动（Supp 0 dB）。改为子词表归一化后
+#    触发率 40%→47%，同时该白名单类的能量带仍被让出，不牺牲保护语义。
+NOISE_CONDITIONAL_GAIN = True
 
 # 检测层门控启用条件（未达标 → allow_gating 必须 False）
 GATING_PREREQ_EVENT_RECALL = 0.95
@@ -176,5 +240,10 @@ if __name__ == "__main__":
     for name in PROFILE_PRESETS:
         ok, msg = validate_profile(get_profile(name))
         print(f"profile {name}: {'OK' if ok else 'FAIL - ' + msg}")
+    # 跨空间自检：同一档位在 4 类头空间里必须仍然是「白名单 0 dB」
+    from vocab import AED4_CLASSES
+    g4 = gains_for(AED4_CLASSES)
+    print("4 类空间增益:", {n: g4[i] for i, n in enumerate(AED4_CLASSES)})
+    assert all(g4[i] == 0.0 for i in whitelist_ids_in(AED4_CLASSES)), "白名单在 4 类空间被误抑制"
     print("MIX_DIR  :", MIX_DIR)
     print("KEEP_SETS:", {k: [config.TARGET_CLASSES[i] for i in v] for k, v in KEEP_SETS.items()})

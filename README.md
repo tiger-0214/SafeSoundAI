@@ -104,6 +104,32 @@ The detection branch never waits on the denoiser, and the denoiser can never rem
 | `code/data_audit.py` | composition, integrity, silence and leakage audits |
 | `code/preprocess_verify.py` | 11-point verification of the segment pipeline |
 | `code/eval_filter.py` | attenuation effect: SNR change vs whitelist preservation |
+| `code/ablate_filter.py` | 2 x 2 ablation (input normalisation x whitelist protection) |
+| `code/gen_ab_demo.py` | audible before/after pairs, with target and interferer stems written separately |
+
+### Denoising branch, measured
+
+The attenuation branch is a class-conditioned spectral gate: an AED posterior selects a per-class gain, the gain is weighted by that class's measured energy envelope, and whitelisted hazards are carved out of the attenuation rather than vetoing it.
+
+Two bugs made the branch look like it did nothing, and both are now fixed (`vocab.py` documents the class-space rule behind one of them):
+
+1. **No per-window normalisation at inference.** The segments the model was trained on are z-scored; the gate fed raw waveforms to the mel transform, so the posterior was systematically wrong. Measured on 200 real mixtures: top-1 against the true noise class went from 0.17 to **0.53** once every window was z-scored.
+2. **Whitelist veto instead of whitelist carve-out.** Any whitelist class above p = 0.5 used to let the whole 1 s window through untouched. Since noise is frequently misread as `car_horn`, the gate sat idle exactly when it was needed. It now attenuates and gives back only the whitelist class's own energy band.
+
+Ablation on 100 test mixtures (`ablate_filter.py`, 1 s, target = noise to suppress, interferer = whitelisted hazard to keep):
+
+| Configuration | Suppression (dB) | Preservation (dB) | Red line violated |
+|:--|--:|--:|--:|
+| previous logic | -0.37 | -0.43 | 7 % |
+| + per-window z-score | -3.70 | -3.10 | 39 % |
+| + carve-out only | -0.35 | -0.40 | 7 % |
+| + both (current) | **-3.51** | **-2.93** | 37 % |
+
+The honest reading: attenuation is now real (-3.5 dB instead of -0.4 dB), but **selectivity is not**, and that is a property of the method rather than of the tuning. A gain applied to a whole frequency band cannot separate a jackhammer from a horn overlapping it in time and frequency; shrinking the safety strength only scales both columns down proportionally (alpha = 0.4 gives -1.35 / -1.05 dB), which is exactly the trade-off already measured for the TSE branch. Recovering selectivity needs a separation model, not a gate, which is why the hard gate stays disabled (`filter_config.ALLOW_GATING = False`).
+
+`eval_filter.py --n 100` on the same split, both branches: AED gate -4.06 dB suppression / -3.32 dB preservation (57 % of mixtures trigger); conditional TSE -13.89 / -9.58 dB, whose selectivity is likewise about 4 dB at 3.4x the suppression.
+
+Warning about the listening material: before this round the only demo audio was `outputs/audio/0X_*.wav`, which turned out to be **220 Hz sine placeholders** (2.50 s each, spectral peak at 220 Hz, `00_air_conditioner` identical in content to `08_siren`). Every earlier "the detector cannot tell these apart" conclusion drawn from them was an artefact of the fake audio. `gen_ab_demo.py` now builds sample pairs from the real mixture corpus with stems, so each pair can be checked by ear and by the numbers at once.
 
 ---
 

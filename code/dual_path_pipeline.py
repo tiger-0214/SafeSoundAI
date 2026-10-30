@@ -101,9 +101,10 @@ class DualPathPipeline:
     ):
         self.device = device
         self.threshold = threshold
+        self.aed_ckpt = ckpt
         self.engine = DecisionEngine(confidence_threshold=threshold)
         self.state = PipelineState()
-        self._model = model
+        self._model = model          # 可直接注入 AEDHead（vocab.load_aed 的返回）
         self._mel = None
         self.use_filter = use_filter
         self._filter = None
@@ -116,33 +117,42 @@ class DualPathPipeline:
     # 模型（懒加载）
     # ------------------------------------------------------------------
     @property
-    def model(self):
+    def head(self):
+        """AED 头（类名/类数/mel 参数一律来自检查点，见 vocab.py）。"""
         if self._model is None:
             import torch
-            from models import DS_CNN
-            path = Path(config.MODEL_DIR) / "ds_cnn_best.pth"
+            import vocab
+            path = Path(self.aed_ckpt or (Path(config.MODEL_DIR) / "ds_cnn_best.pth"))
             if not path.exists():
                 return None                      # 无权重 → 只跑电平/降噪支路
             self.device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
-            m = DS_CNN().to(self.device)
-            ck = torch.load(path, map_location=self.device)
-            m.load_state_dict(ck.get("state_dict", ck))
-            m.eval()
-            self._model = m
+            self._model = vocab.load_aed(path, device=self.device)
         return self._model
 
+    @property
+    def model(self):
+        h = self.head
+        return None if h is None else h.model
+
+    @property
+    def classes(self) -> list[str]:
+        h = self.head
+        return [] if h is None else list(h.classes)
+
     def classify(self, raw_win: np.ndarray) -> np.ndarray | None:
-        """支路 A 的分类前向：z-score → mel → DS_CNN。无权重时返回 None。"""
-        m = self.model
-        if m is None:
+        """支路 A 的分类前向：z-score → mel → AED。无权重时返回 None。"""
+        h = self.head
+        if h is None:
             return None
         import torch
         from mel import waveform_to_logmel
-        if self._mel is None:
-            self._mel = True
         with torch.no_grad():
-            x = waveform_to_logmel(zscore(raw_win)).unsqueeze(0).unsqueeze(0).to(self.device)  # (1,1,n_mels,frames)
-            return torch.softmax(m(x), 1).cpu().numpy()[0]
+            x = waveform_to_logmel(zscore(raw_win), n_fft=h.mel["n_fft"],
+                                   hop_length=h.mel["hop_length"],
+                                   win_length=h.mel["win_length"],
+                                   frames=h.mel["frames"])
+            x = x.unsqueeze(0).unsqueeze(0).to(self.device)           # (1,1,n_mels,frames)
+            return torch.softmax(h.model(x), 1).cpu().numpy()[0]
 
     # ------------------------------------------------------------------
     # 主处理（离线）
@@ -168,7 +178,7 @@ class DualPathPipeline:
             if win_det is None:
                 continue
 
-            cls = config.TARGET_CLASSES[win_det.class_id]
+            cls = self.classes[win_det.class_id]          # ← 本头自己的类名（vocab 铁律）
             self.state.level.push(cls, lvl)
             q = self.state.level.quantile(cls, lvl)
             dur, reps = self.state.touch(cls, t)

@@ -29,6 +29,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 import config
+import vocab
 
 
 # ---------------------------------------------------------------------------
@@ -315,12 +316,22 @@ class DecisionEngine:
     注意：置信度只用于**仲裁与门限**，不参与紧迫度数值（语义反直觉，审稿人会问）。
     """
 
-    def __init__(self, confidence_threshold: float = 0.8):
+    def __init__(self, confidence_threshold: float = 0.8,
+                 classes: list[str] | tuple[str, ...] | None = None):
+        # classes = **产出 class_id 的那个模型**的类别表（vocab 铁律）。
+        # 默认取 4 类产品头；传 10 类 legacy 头时请显式传入 config.TARGET_CLASSES。
+        # 历史 bug：这里曾固定用 config.TARGET_CLASSES[class_id] 反查，
+        # 于是 4 类头的 gun_shot(2) 被读成 children_playing、siren(0) 被读成
+        # air_conditioner，触觉紧迫度整条链错位。
         self.threshold = confidence_threshold
+        self.classes = list(classes) if classes is not None else list(vocab.AED4_CLASSES)
 
     def _urgency(self, class_id: int) -> str:
-        name = config.TARGET_CLASSES[class_id]
+        name = self.classes[int(class_id)]
         return PRIOR_URGENCY.get(name, "alert")
+
+    def name_of(self, class_id: int) -> str:
+        return self.classes[int(class_id)]
 
     def arbitrate(self, detections: list[Detection]) -> Detection | None:
         valid = [d for d in detections if d.confidence >= self.threshold]
@@ -361,11 +372,19 @@ if __name__ == "__main__":
     print("  历史 -60..-24 dB 时，-30 dB 的分位 =", round(nz.quantile("siren", -30), 3))
 
     print("\n=== 决策引擎仲裁（gun_shot 应胜）===")
+    # 用 4 类产品头空间自检（与 demo.py 实际部署口径一致）
     engine = DecisionEngine(confidence_threshold=0.8)
+    c4 = {n: i for i, n in enumerate(vocab.AED4_CLASSES)}
     dets = [
-        Detection(config.CLASS_TO_IDX["siren"], 0.95),
-        Detection(config.CLASS_TO_IDX["gun_shot"], 0.85),
-        Detection(config.CLASS_TO_IDX["car_horn"], 0.90),
+        Detection(c4["siren"], 0.95),
+        Detection(c4["gun_shot"], 0.85),
+        Detection(c4["car_horn"], 0.90),
     ]
     chosen = engine.arbitrate(dets)
-    print(f"  仲裁结果: {config.TARGET_CLASSES[chosen.class_id]}")
+    print(f"  仲裁结果: {engine.name_of(chosen.class_id)}（4 类空间）")
+    # 再用 10 类 legacy 空间自检，证明同一 id 在不同空间不会串味
+    engine10 = DecisionEngine(confidence_threshold=0.8, classes=config.TARGET_CLASSES)
+    dets10 = [Detection(config.CLASS_TO_IDX["siren"], 0.95),
+              Detection(config.CLASS_TO_IDX["gun_shot"], 0.85),
+              Detection(config.CLASS_TO_IDX["car_horn"], 0.90)]
+    print(f"  仲裁结果: {engine10.name_of(engine10.arbitrate(dets10).class_id)}（10 类空间）")

@@ -44,12 +44,20 @@ Every path resolves from `config.py`; override the preprocessed-data root with `
 
 | File | Role |
 |:--|:--|
-| `filter_config.py` | per-class gain tables, user profiles, hard safety constraints |
-| `attenuator.py` | spectral-gate attenuation |
+| `filter_config.py` | per-class gain tables **declared by class name**, user profiles, hard safety constraints |
+| `attenuator.py` | spectral-gate attenuation (per-window z-score + whitelist spectral carve-out) |
 | `tse_model.py` / `train_tse.py` | conditional target-speech-enhancement denoiser |
 | `filter_pipeline.py` | streaming attenuation with fail-open on low confidence |
 | `synth_mix.py` | signal-level mix builder for reproducible tests |
 | `eval_filter.py` | measured attenuation vs whitelist preservation |
+| `ablate_filter.py` | 2x2 ablation (z-score / carve-out) on the real mixture set → `filter_ablation.md` |
+| `gen_ab_demo.py` | audible before/after pairs with separate target / interferer stems |
+
+## Vocabulary
+
+| File | Role |
+|:--|:--|
+| `vocab.py` | **single source of truth** for class spaces: the 10-class source space (filter branch) and the AED head space (4-class product model). Loads a checkpoint together with its own class list and mel profile; nothing may index a class list it did not produce. |
 
 ## Demos
 
