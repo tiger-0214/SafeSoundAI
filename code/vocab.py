@@ -29,6 +29,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import warnings
+
 import torch
 
 import config
@@ -55,24 +57,65 @@ NOISE_CLASSES: frozenset[str] = frozenset(
 MEL_PROFILES: dict[str, dict[str, int]] = {
     "fft512":  {"n_fft": 512,  "win_length": 512, "hop_length": 160, "frames": 100},
     "fft1024": {"n_fft": 1024, "win_length": 640, "hop_length": 160, "frames": 100},
+    # 0.5 s 短窗（P0-2）：帧数随窗长减半，n_fft/win 与 fft1024 一致
+    "fft1024f50": {"n_fft": 1024, "win_length": 640, "hop_length": 160, "frames": 50},
 }
 
 
+def _mel_from_blob(blob: dict | None) -> dict[str, int] | None:
+    """从检查点里取出显式 mel 参数（有就信它，没有就 None）。"""
+    if not isinstance(blob, dict):
+        return None
+    raw = blob.get("mel")
+    if not isinstance(raw, dict) or "n_fft" not in raw:
+        return None
+    keys = ("n_fft", "win_length", "hop_length", "frames")
+    return {k: int(raw[k]) for k in keys if k in raw}
+
+
 def infer_mel_profile(ckpt: str | Path, blob: dict | None = None) -> str:
-    """从检查点推断 mel 档位：优先 blob 显式字段，其次文件名标记，兜底 fft512。"""
+    """从检查点推断 mel 档位：优先 blob 显式字段，其次文件名标记，兜底 fft512。
+
+    .. warning::
+       文件名兜底是**静默危险**的：把 ``xxx_fft1024.pt`` 改名成 ``xxx.pt``，
+       推理就会按 fft512 变换，输出照样有个 softmax，只是全错。所以
+       ``load_aed`` 会在此路径上告警，训练脚本必须把 mel 字典写进检查点。
+    """
     if blob:
-        for key in ("mel_profile", "mel", "n_fft"):
+        raw = _mel_from_blob(blob)
+        if raw:
+            for name, prof in MEL_PROFILES.items():
+                if all(prof.get(k) == v for k, v in raw.items()):
+                    return name
+            return "custom"
+        for key in ("mel_profile", "n_fft"):
             v = blob.get(key)
             if isinstance(v, str) and v in MEL_PROFILES:
                 return v
-            if isinstance(v, dict) and "n_fft" in v:
-                return "fft1024" if int(v["n_fft"]) >= 1024 else "fft512"
             if isinstance(v, int):
                 return "fft1024" if v >= 1024 else "fft512"
     name = Path(ckpt).name.lower()
     if "fft1024" in name or "nfft1024" in name:
         return "fft1024"
     return "fft512"
+
+
+def resolve_mel(ckpt: str | Path, blob: dict | None = None) -> tuple[str, dict[str, int]]:
+    """返回 (档位名, 生效的 mel 参数)。
+
+    显式元数据 > MEL_PROFILES 档位 > config 默认。``custom`` 档位表示检查点
+    自带一套表里没有的参数，此时完全用检查点里的值。
+    """
+    profile = infer_mel_profile(ckpt, blob)
+    if profile == "custom":
+        base = dict(MEL_PROFILES["fft1024"])
+    else:
+        base = dict(MEL_PROFILES[profile])
+    base.setdefault("hop_length", 160)
+    base.setdefault("frames", 100)
+    raw = _mel_from_blob(blob) or {}
+    base.update(raw)                       # 检查点里的值覆盖档位默认
+    return profile, base
 
 
 # --------------------------------------------------------------------------- 3) AED 加载
@@ -122,12 +165,19 @@ def load_aed(ckpt: str | Path | None = None, device: str | torch.device = "cpu")
     if not classes:
         raise ValueError(f"{ckpt} 无法确定类别表")
 
-    profile = infer_mel_profile(ckpt, blob if isinstance(blob, dict) else None)
+    blob_d = blob if isinstance(blob, dict) else None
+    profile, mel_params = resolve_mel(ckpt, blob_d)
+    if blob_d is None or _mel_from_blob(blob_d) is None:
+        warnings.warn(
+            f"检查点 {Path(ckpt).name} 没有 mel 元数据，按文件名推断档位 {profile} "
+            f"(n_fft={mel_params['n_fft']}, frames={mel_params['frames']})。"
+            "改名或换窗长都会静默改变输入分布 —— 训练脚本应写入 'mel' 字典。",
+            RuntimeWarning, stacklevel=2)
     model = DS_CNN(n_classes=len(classes))
     model.load_state_dict(sd)
     model.to(device).eval()
     return AEDHead(model=model, classes=classes, mel_profile=profile,
-                   mel=MEL_PROFILES[profile], ckpt=ckpt,
+                   mel=mel_params, ckpt=ckpt,
                    macro_f1=float(f1) if f1 is not None else None)
 
 

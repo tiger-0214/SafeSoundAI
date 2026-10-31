@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
@@ -36,7 +37,8 @@ CKPT = Path(config.MODEL_DIR) / "dscnn_v2_4cls_fft1024.pt"
 META = Path(config.PREPROCESSED) / "trigger_v2" / "metadata_v2.csv"
 
 DURATION_S = 60.0
-WIN_S = 1.0
+WIN_S = 1.0      # 窗长（--win-s 可改；0.5 需配合短窗权重看精度代价）
+HOP_S = 0.25
 DEVICE_SR = 48000
 
 
@@ -153,7 +155,7 @@ def run_stream(wav: Path) -> tuple[dict, list]:
     rt = StreamingRuntime(
         backend=build_backend("wavefile", path="/tmp/demo_haptics.wav",
                               duration_s=DURATION_S + 5),
-        ckpt=CKPT, device_sr=DEVICE_SR)
+        ckpt=CKPT, device_sr=DEVICE_SR, win_s=WIN_S, hop_s=HOP_S)
     print(f"  AED 头: {getattr(rt.pipe.head, 'classes', '未加载')}")
     warm = rt.warmup(3)
     print(f"  预热 {warm:.3f}s（不计入延迟统计）")
@@ -266,7 +268,15 @@ def score_events(events: list[tuple[float, str, float]], traces: list) -> dict:
 
 # --------------------------------------------------------------------------
 def main() -> int:
-    print("SafeSoundAI 端到端 demo（检测 → 决策 → 触觉）")
+    global WIN_S, HOP_S, DURATION_S, CKPT
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--win-s", type=float, default=WIN_S, help="窗长（秒）；0.5 = 短窗")
+    ap.add_argument("--hop-s", type=float, default=HOP_S, help="步长（秒）")
+    ap.add_argument("--duration", type=float, default=DURATION_S)
+    ap.add_argument("--ckpt", default=str(CKPT), help="AED 权重（短窗权重配 --win-s 0.5）")
+    a = ap.parse_args()
+    WIN_S, HOP_S, DURATION_S, CKPT = a.win_s, a.hop_s, a.duration, Path(a.ckpt)
+    print(f"SafeSoundAI 端到端 demo（检测 → 决策 → 触觉）win={WIN_S}s hop={HOP_S}s")
     h = health_check()
     if h["fatal"]:
         hr("❌ 致命项，先修这些再跑")
@@ -303,6 +313,7 @@ def main() -> int:
 
     REPORT.mkdir(parents=True, exist_ok=True)
     out = {"scene_kind": kind, "scene": str(wav), "duration_s": DURATION_S,
+           "win_s": WIN_S, "hop_s": HOP_S,
            "device_sr": DEVICE_SR, "ckpt": str(CKPT),
            "stream": summ, "event_level": ev_score,
            "health": {"fatal": h["fatal"], "warn": h["warn"]}}

@@ -52,6 +52,21 @@ check-detection:
 	@echo "=== 检测侧数字门禁 ==="
 	@$(PY) code/audit_detection_numbers.py --check | tail -3
 
+# ---------------------------------------------------------------- 训练（可溯源）
+# 4 类部署头（论文里报的那个）。检查点会写入 mel 元数据，别再靠文件名猜档位。
+train-4cls:
+	$(PY) code/train_dscnn_v2.py --exclude-class fireworks --n-fft 1024 \
+		--epochs 25 --tag 4cls_fft1024
+
+# 0.5 s 短窗（P0-2 可行性）：帧数随窗长减半，不补零
+train-short05:
+	$(PY) code/train_dscnn_v2.py --exclude-class fireworks --n-fft 1024 \
+		--crop-frac 0.5 --epochs 25 --tag short05
+
+# 1 s 权重 vs 0.5 s 权重 同集对比
+shortwin:
+	$(PY) code/eval_short_window.py
+
 # ---------------------------------------------------------------- 部署
 onnx:
 	$(PY) code/export_onnx.py

@@ -20,11 +20,13 @@ Every path resolves from `config.py`; override the preprocessed-data root with `
 
 | File | Role |
 |:--|:--|
-| `mel.py` | waveform → log-Mel (128 × 100) |
+| `mel.py` | waveform → log-Mel (128 × 100); frame count is a parameter, never a padded constant |
 | `dataset.py` | segment dataset, on-the-fly Mel, fold-aware sampling |
 | `models.py` | DS-CNN (67 K parameters) |
 | `train_baseline.py` | MFCC + linear SVM lower bound |
-| `train_dscnn.py` | DS-CNN training; `--exclude-class` builds the 4-class model |
+| `train_dscnn.py` | DS-CNN training (v1, 10-class source space); `--exclude-class` builds the 4-class model |
+| `train_dscnn_v2.py` | **the script that produced the deployment head** (trigger_v2, recording-level split, temperature calibration). Writes a `mel` dict into the checkpoint so mel params travel with the weights instead of being guessed from the filename; `--crop-frac 0.5` trains the 0.5 s short-window variant, halving the frame count (no zero-padding) |
+| `eval_short_window.py` | P0-2 feasibility: same test segments scored with the 1 s head at 1.0 s / 0.5 s windows and the 0.5 s head at 0.5 s, so the latency-vs-accuracy trade-off is one JSON instead of folklore |
 | `evaluate.py` | accuracy, F1, confusion matrix, latency |
 | `eval_report.py` | per-class PRF, calibration, latency tables and figures |
 | `eval_emergency.py` | event-level recall and false-alarm rate across a threshold sweep |
@@ -61,7 +63,7 @@ Every path resolves from `config.py`; override the preprocessed-data root with `
 
 | File | Role |
 |:--|:--|
-| `vocab.py` | **single source of truth** for class spaces: the 10-class source space (filter branch) and the AED head space (4-class product model). Loads a checkpoint together with its own class list and mel profile; nothing may index a class list it did not produce. |
+| `vocab.py` | **single source of truth** for class spaces: the 10-class source space (filter branch) and the AED head space (4-class product model). Loads a checkpoint together with its own class list and mel params (checkpoint metadata wins over the filename, which is only a fallback and warns when used); nothing may index a class list it did not produce. |
 
 ## Demos
 
