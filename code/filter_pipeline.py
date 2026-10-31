@@ -71,9 +71,30 @@ class FilterPipeline:
         self.force_b = bool(force_b)
         # 安全强度 α：g_eff = 1 - α(1 - g)，α=1 为模型原生掩码（默认）
         self.strength = fc.TSE_STRENGTH if strength is None else float(strength)
-        self._gain_col: np.ndarray | None = None
+        self._gain_cache: np.ndarray | None = None
         self._info_cache: dict = {}
         self.state = FilterState()
+
+    def _shift_gain_cache(self, T: int) -> np.ndarray:
+        """零阶保持：把上次重算的掩码沿时间轴推进一个 BLOCK，而不是用末帧常数。
+
+        旧版 ``np.repeat(gain[:, -1:], T)`` 在掩码逐帧变化时会造出块边界突变 ——
+        V2 帧级语音门控让掩码真的逐帧变了，实测块边界爆音 0.115 > 阈值 0.104。
+        平移缓存既保住"模型降频"的算力收益，又保持跨块连续。
+        """
+        c = self._gain_cache
+        step = BLOCK // fc.FILTER_HOP
+        if c is None:
+            return np.ones((fc.FILTER_N_FFT // 2 + 1, T), dtype=np.float32)
+        if c.shape[1] <= step:
+            return np.repeat(c[:, -1:], T, axis=1)
+        shifted = c[:, step:]
+        if shifted.shape[1] < T:
+            shifted = np.pad(shifted, ((0, 0), (0, T - shifted.shape[1])), mode="edge")
+        else:
+            shifted = shifted[:, :T]
+        self._gain_cache = shifted
+        return shifted
 
     # ------------------------------------------------------------------
     # 单块处理（流式核心）
@@ -92,16 +113,24 @@ class FilterPipeline:
         info = {"top": config.TARGET_CLASSES[top], "conf": round(conf, 3),
                 "executor": "A", "applied": True}
 
-        # fail-open：置信度不足 → 直通
+        # fail-open 已改为「语音门控 fallback」（V2）：低置信不再整块直通，
+        # 否则所有认不出的声音（脚步/键盘/交通/鸟叫）都会原样进耳朵，降噪等于没做。
         if conf < FAIL_OPEN_CONF:
             self.state.fail_open += 1
-            info.update(executor="fail-open", applied=False)
-            return np.ones((F, probs.shape[0]), dtype=np.float32), info
+            info.update(executor="gate-fallback", applied=True)
+            gain_db = np.full((F, probs.shape[0]),
+                              float(fc.SPEECH_GATE_FALLBACK_DB), dtype=np.float32)
+        else:
+            mel_gain = self.att.gain_curve_db(probs)
+            gain_db = mel_to_linear_gain(mel_gain)      # (F,T) dB
+            allow = self.att.hard_gate_mask(probs)
+            gain_db[:, ~allow] = 0.0
 
-        mel_gain = self.att.gain_curve_db(probs)
-        gain_db = mel_to_linear_gain(mel_gain)          # (F,T) dB
-        allow = self.att.hard_gate_mask(probs)
-        gain_db[:, ~allow] = 0.0
+        # V2 帧级语音门控：无论上面走哪个分支，语音帧都抬回 0 dB（10 ms 粒度）
+        T_full = 1 + len(buf) // fc.FILTER_HOP
+        if gain_db.shape[1] < T_full:
+            gain_db = np.pad(gain_db, ((0, 0), (0, T_full - gain_db.shape[1])), mode="edge")
+        gain_db = self.att.apply_voice_gate(gain_db, buf, gain_db.shape[1])
         gain_lin = (10.0 ** (gain_db / 20.0)).astype(np.float32)
 
         # 方案 B：AED 高置信且 TSE 可用 → 用条件掩码，A 的增益作为上界保护
@@ -150,7 +179,6 @@ class FilterPipeline:
         y = np.asarray(y, dtype=np.float32)
         n = len(y)
         out = np.zeros(n, dtype=np.float32)
-        prev_tail: np.ndarray | None = None
         t0 = time.perf_counter()
 
         for blk, start in enumerate(range(0, n, BLOCK)):
@@ -162,46 +190,45 @@ class FilterPipeline:
             # 模型调用降频：每 MODEL_HOP 个块推一次，中间块沿用上一次掩码的末帧（零阶保持）。
             # 依据：AED 分析窗本来就该从 1 s 缩短到 250–400 ms（filter_constraints §三·L2），
             # 逐 100 ms 重跑 1.7 s 上下文属于 17× 冗余（实测 RTF 1.26 → 不可实时）。
-            if blk % MODEL_HOP == 0 or self._gain_col is None:
+            if blk % MODEL_HOP == 0 or self._gain_cache is None:
                 gain, info = self._mask_for_block(buf)
-                self._gain_col = gain[:, -1:].copy()
+                self._gain_cache = gain
                 self._info_cache = dict(info)
+                recomputed = True
             else:
                 info = dict(self._info_cache)
                 info["held"] = True
+                recomputed = False
             info = {"t": round(start / config.SAMPLE_RATE, 2), **info}
             self._last_info = info
 
-            if info.get("executor") == "fail-open":
+            if recomputed:
+                g = gain[:, :T]
+                if g.shape[1] < T:
+                    g = np.pad(g, ((0, 0), (0, T - g.shape[1])), mode="edge")
+            else:
+                g = self._shift_gain_cache(T)
+            seg = istft(Y * torch.from_numpy(g).to(device=Y.device, dtype=Y.dtype),
+                        len(buf)).cpu().numpy()[-BLOCK:]
+
+            e_in = float(np.mean(buf[-BLOCK:] ** 2) + 1e-12)
+            e_out = float(np.mean(seg ** 2) + 1e-12)
+            delta = 10 * np.log10(e_out / e_in)
+            info["delta_db"] = round(float(delta), 2)
+            if delta < fc.ANTI_COLLAPSE_DB:
+                self.state.over_suppression += 1
+                info.update(applied=False, executor="anti-collapse")
                 seg = buf[-BLOCK:].copy()
             else:
-                if blk % MODEL_HOP == 0:
-                    g = gain[:, :T]
-                    if g.shape[1] < T:
-                        g = np.pad(g, ((0, 0), (0, T - g.shape[1])), mode="edge")
-                else:
-                    g = np.repeat(self._gain_col, T, axis=1)
-                seg = istft(Y * torch.from_numpy(g).to(device=Y.device, dtype=Y.dtype),
-                            len(buf)).cpu().numpy()[-BLOCK:]
-
-                e_in = float(np.mean(buf[-BLOCK:] ** 2) + 1e-12)
-                e_out = float(np.mean(seg ** 2) + 1e-12)
-                delta = 10 * np.log10(e_out / e_in)
-                info["delta_db"] = round(float(delta), 2)
-                if delta < fc.ANTI_COLLAPSE_DB:
-                    self.state.over_suppression += 1
-                    info.update(applied=False, executor="anti-collapse")
-                    seg = buf[-BLOCK:].copy()
-                else:
-                    info.setdefault("executor", "A")
-                    info["applied"] = True
+                info.setdefault("executor", "A")
+                info["applied"] = True
 
             seg = seg[:end - start]
-            if prev_tail is not None and len(seg) > FADE:
-                w = np.linspace(0, 1, FADE, dtype=np.float32)
-                seg[:FADE] = prev_tail[:FADE] * (1 - w) + seg[:FADE] * w
+            # 注意：这里**不能**做交叉淡化。buf 带 CTX 左侧上下文、istft 内部已
+            # 完整 overlap-add，块接缝天然连续（实测 boundary 0.0275 ≈ interior
+            # p99.9 0.0278）。旧版把 `prev_tail[:FADE]`（上一块的**开头**）与本块
+            # 开头混合，等于往接缝处掺入一段无关相位的信号，制造 0.11 的爆音。
             out[start:end] = seg
-            prev_tail = seg.copy()
             self.state.blocks += 1
             if collect:
                 self.state.history.append(info)

@@ -18,20 +18,29 @@ from pathlib import Path
 import config
 
 # ---------------------------------------------------------------------------
-# 「background」到底是什么 —— 这一节写死语义，避免三个模块各理解一套
+# 降噪目标定义 —— 2026-10-31 设计澄清后重写（推翻旧 R1/R2/R3 的前提）
 # ---------------------------------------------------------------------------
-# 4 类部署头里 ``background`` 不是"安静"，而是**"不是那三种危险声"**：
-# 空调、电钻、狗叫、儿童嬉闹、街道音乐全在同一个格子里。由此推出三条硬规则：
+# **项目设计事实**：耳机内降噪目标 = *除人声外全部衰减*。
+#   危险声（警笛 / 车喇叭 / 枪声 / 狗叫）**不靠耳机听觉保留，靠触觉振动通道交付**。
+#   因此「把危险声压掉」是**设计意图**，不是缺陷；旧版把它们列成「永不抑制」
+#   与设计直接冲突（评测里那条 44% 的"白名单红线"随之作废）。
 #
-#   R1. background **永远不给负增益**。对它下 -12 dB 等于连狗叫、儿童喊叫一起压掉，
-#       而这两类恰是聋人需要知道的。分不清就别动 —— fail-open 0 dB。
-#   R2. background **永远不给正增益**。enhance 只对白名单生效；放大环境底噪
-#       只会把信噪比推向更差（这正是"助听器放大一切"的老毛病）。
-#   R3. background **不进白名单**。白名单是"绝不抑制"的意思，
-#       而 background 在 4 类头里本来就得不到任何增益，列进去只会误导读者。
+# 新三条规则（V1–V3）：
 #
-# 想真正衰减空调/电钻，必须交给 10 类头（filter 支路），由它把类别拆开再说。
-# 这就是 gains_for() 遇到语义表里没有的类名时回落到 0 dB 的全部理由。
+#   V1. **人声永不抑制**。10 类词表里只有 ``children_playing`` 含人声（儿童喊叫）
+#       ⇒ 恒 0 dB。词表里没有 speech 类，一般成人语音会落到「未识别」，
+#       由 V2 的语音门控兜住。
+#   V2. **词表外的声音默认衰减（fail-closed），但必须过语音门控**。
+#       取代旧版"未识别 → fail-open 0 dB"——那等于把脚步、键盘、鸟叫、交通
+#       全部原样放进来，降噪等于没做。新逻辑：VAD 判为语音的帧抬回 0 dB，
+#       其余帧按 ``SPEECH_GATE_FALLBACK_DB`` 衰减。开关 ``SPEECH_GATE``。
+#   V3. **抑制必须有限幅**。total ≤ 档位 ``max_total_attenuation_db``（≤24 dB）
+#       且受 ``ANTI_COLLAPSE_DB`` 兜底，避免"全压"压成一片死寂 ——
+#       PTSD 次臂的"触觉不得惊跳 / 不得丧失环境感"约束也依赖这条。
+#
+# 4 类部署头里的 ``background`` 是"不是那三种危险声"的袋子（空调、电钻、狗叫、
+# 儿童嬉闹、街道音乐都在里面），分不出来 ⇒ 正是 V2 语音门控的适用对象：
+# 门控判为语音就放行（保护儿童喊叫），否则按 fallback 压。
 
 # ---------------------------------------------------------------------------
 # 语义三表（filter_spec.md §二）—— class_id 与 config.TARGET_CLASSES 对齐
@@ -44,14 +53,31 @@ NAME_TO_ID = {name: i for i, name in enumerate(config.TARGET_CLASSES)}
 # （0=siren,1=car_horn,2=gun_shot,3=background）索引全部错位，
 # 警笛会被打上 air_conditioner 的 -12 dB 增益。故所有语义一律按名字声明，
 # 由 gains_for(classes) 在运行时翻译到**当前头自己的空间**。
-WHITELIST_NAMES = {                                   # 永不抑制（安全关键）
-    "siren": 0.0, "car_horn": 0.0, "gun_shot": 0.0, "dog_bark": 0.0,
-}
-BLACKLIST_NAMES = {                                   # 默认抑制，用户可调
+WHITELIST_NAMES: dict[str, float] = {}                 # 清空（V1）：不再有"永不抑制"的类
+ATTENUATE_NAMES = {                                    # 默认抑制，用户可调
+    # 危险声 —— 耳机内压掉，改由触觉振动交付（2026-10-31 设计澄清）
+    "siren": -12.0, "car_horn": -12.0, "gun_shot": -12.0, "dog_bark": -12.0,
+    # 环境噪声
     "air_conditioner": -12.0, "street_music": -12.0,
     "drilling": -6.0, "jackhammer": -6.0, "engine_idling": -6.0,
 }
-NEUTRAL_NAMES = {"children_playing": 0.0}              # 中性：不主动处理
+VOICE_NAMES = {"children_playing": 0.0}                # 人声类：恒 0 dB（V1）
+
+BLACKLIST_NAMES = ATTENUATE_NAMES                      # 向后兼容别名
+NEUTRAL_NAMES = VOICE_NAMES                            # 向后兼容别名
+
+# --- 语音门控（V2）：词表里分不清的声音，由 VAD 而不是"直通"来兜底 ----------
+# Silero VAD 逐帧判定；语音帧抬回 SPEECH_GATE_HOLD_DB，非语音帧按 fallback 衰减。
+# 前后各留 SPEECH_GATE_MARGIN_MS 保护带，否则字头字尾会被削掉（听感上是"断续"）。
+SPEECH_GATE = True
+SPEECH_GATE_FALLBACK_DB = -12.0                       # 非语音帧衰减量
+SPEECH_GATE_HOLD_DB = 0.0                             # 语音帧增益
+SPEECH_GATE_MARGIN_MS = 150.0                         # 语音判定前后保护带
+SPEECH_GATE_MIN_SILENCE_MS = 100.0                    # 短于此的非语音空洞不压（防抖）
+VAD_THRESHOLD = 0.5                                   # Silero 语音概率阈值
+SPEECH_GATE_SMOOTH = 0.6                              # 门控一阶平滑（越大越软）
+# 4 类头 background 显式声明为「门控类」（它分不出空调/电钻/狗叫/儿童喊叫）
+SPEECH_GATED_NAMES = {"background": SPEECH_GATE_FALLBACK_DB}
 
 # 源类空间（10 类）下的 id 版本 —— 过滤支路内部仍用 10 类坐标
 WHITELIST = {NAME_TO_ID[n]: g for n, g in WHITELIST_NAMES.items() if n in NAME_TO_ID}
@@ -77,13 +103,13 @@ _PROFILE_NAMES = {
         "enhance_whitelist_db": 0.0,
         "max_total_attenuation_db": 24.0,
     },
-    "awareness": {
+    "awareness": {                                     # 减弱抑制：保留更多环境感知
         "profile_id": "awareness",
-        "gains": {**{n: 3.0 for n in WHITELIST_NAMES},
+        "gains": {"siren": -6.0, "car_horn": -6.0, "gun_shot": -6.0, "dog_bark": -6.0,
                   "air_conditioner": -6.0, "street_music": -6.0,
                   "drilling": 0.0, "jackhammer": 0.0, "engine_idling": 0.0,
-                  **NEUTRAL_NAMES},
-        "enhance_whitelist_db": 3.0,
+                  **VOICE_NAMES},
+        "enhance_whitelist_db": 0.0,
         "max_total_attenuation_db": 12.0,
     },
 }
@@ -140,34 +166,47 @@ def gains_for(
     `warn=True` 时对每个新遇到的未知头**只告警一次**（`_WARNED_HEADS` 去重），
     否则流式循环里每 250 ms 刷一条，日志会被淹掉。
     """
-    by_name = get_profile_names(profile)["gains"]
+    by_name = dict(get_profile_names(profile)["gains"])
+    if SPEECH_GATE:                       # V2：门控类显式并入（background 等）
+        by_name.update(SPEECH_GATED_NAMES)
     unknown = [n for n in classes if n not in by_name]
     if unknown:
         key = tuple(classes)
-        msg = (f"类名 {unknown} 不在声学语义表里 → 这些类按 0 dB 处理（fail-open）。"
-               f"当前头空间 {list(classes)}。若这是 4 类头的 background，属预期；"
-               f"若是别的头，说明语义表没跟上。")
+        msg = (f"类名 {unknown} 不在声学语义表里 → 这些类按 "
+               f"{SPEECH_GATE_FALLBACK_DB if SPEECH_GATE else 0.0:+.1f} dB 处理"
+               f"（SPEECH_GATE={SPEECH_GATE}）。若不是预期，说明语义表没跟上。")
         if strict:
             raise KeyError(msg)
         if warn and key not in _WARNED_HEADS:
             _WARNED_HEADS.add(key)
             warnings.warn(msg, RuntimeWarning, stacklevel=2)
-    return {i: float(by_name.get(n, 0.0)) for i, n in enumerate(classes)}
+    fallback = SPEECH_GATE_FALLBACK_DB if SPEECH_GATE else 0.0
+    return {i: float(by_name.get(n, fallback)) for i, n in enumerate(classes)}
 
 
 def background_gain_guard(classes: list[str] | tuple[str, ...],
                           gains: dict[int, float]) -> None:
-    """R1/R2 的运行时断言：background 的增益必须恰好 0 dB。
+    """V1/V2 的运行时断言：门控类（background）的增益必须落在允许区间。
 
-    任何档位、任何头空间，只要 background 拿到非 0 增益就说明语义表被改坏了
-    （负增益会误伤狗叫/儿童，正增益会抬底噪）。放在这里而不是测试里，
-    是因为它同时保护部署路径。
+    旧版（R1）要求 background 恰好 0 dB —— 那时危险声还算"要保留"。
+    新设计下 background 交给语音门控：**语音帧 0 dB、非语音帧 fallback**，
+    所以静态增益表里它只能是这两个值之一。禁止的是：
+      * 正增益 —— 抬底噪，助听器"放大一切"的老毛病；
+      * 比 fallback 更深的衰减 —— 门控再准也救不回被压死的儿童喊叫。
+    放在这里而不是测试里，是因为它同时保护部署路径。
     """
+    lo = SPEECH_GATE_FALLBACK_DB if SPEECH_GATE else 0.0
     for i, n in enumerate(classes):
-        if n == "background" and abs(gains.get(i, 0.0)) > 1e-9:
+        if n not in SPEECH_GATED_NAMES:
+            continue
+        g = float(gains.get(i, 0.0))
+        if g > 1e-9:
             raise AssertionError(
-                f"background 必须 0 dB（R1/R2），实测 {gains[i]:+.2f} dB；"
-                f"档位增益表被改坏了")
+                f"{n} 不得给正增益（V1/V2），实测 {g:+.2f} dB；档位增益表被改坏了")
+        if g < lo - 1e-9:
+            raise AssertionError(
+                f"{n} 的衰减不得深于门控下限 {lo:+.1f} dB，实测 {g:+.2f} dB；"
+                f"会连儿童喊叫一起压掉，档位增益表被改坏了")
 
 
 def whitelist_ids_in(classes: list[str] | tuple[str, ...]) -> frozenset[int]:

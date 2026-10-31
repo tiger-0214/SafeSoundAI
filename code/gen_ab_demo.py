@@ -92,14 +92,14 @@ def main() -> None:
         mask = att.mask_from(mix)
         supp = suppress_gain(tgt, mix, mask)
         pres = suppress_gain(itf, mix, mask)
-        # 判定分四类，避免把「安全策略」误读成「降噪失败」
+        # 判定分四类。2026-10-31 语义翻转后「白名单保护」不再是正确行为：
+        # 危险声（interferer）**应当被压**，它被保留下来才是异常。
         if supp > -1.0:
-            verdict = ("🛡️ 检出白名单类→整窗直通" if info["top_name"] in fc.WHITELIST_NAMES
-                       else "➖ 置信不足→fail-open 直通")
-        elif pres <= fc.HARD_GATE_TOLERANCE_DB:
-            verdict = "⚠️ 有效但误伤白名单"
+            verdict = "➖ 未衰减（VAD 判为语音或置信不足被门控放行）"
+        elif pres > fc.HARD_GATE_TOLERANCE_DB:
+            verdict = "⚠️ 有效但危险声被保留（与「除人声外全压」冲突）"
         else:
-            verdict = "✅ 有效且安全"
+            verdict = "✅ 有效且符合设计"
         tag = f"{i:02d}_{r['target_class']}"
         sf.write(OUT / f"{tag}_mix.wav", mix, config.SAMPLE_RATE, subtype="PCM_16")
         sf.write(OUT / f"{tag}_aed.wav", y_out, config.SAMPLE_RATE, subtype="PCM_16")

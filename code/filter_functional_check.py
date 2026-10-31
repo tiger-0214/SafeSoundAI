@@ -170,15 +170,20 @@ def check_gain_table_translation(att: SpectralGateAttenuator) -> None:
     prof = fc._PROFILE_NAMES[fc.DEFAULT_PROFILE]["gains"]
     bad = [(n, att.gains[i]) for i, n in enumerate(att.classes)
            if abs(att.gains.get(i, 0.0) - prof.get(n, 0.0)) > 1e-9]
-    wl_bad = [(n, att.gains[i]) for i, n in enumerate(att.classes)
-              if n in fc.WHITELIST_NAMES and abs(att.gains.get(i, 0.0)) > 1e-9]
+    # 2026-10-31 语义翻转后，白名单恒为空 —— 原来那条「白名单非 0」检查失去对象。
+    # 换成两条真正保护设计意图的：人声类不得被压、危险声必须被压。
+    voice_bad = [(n, att.gains[i]) for i, n in enumerate(att.classes)
+                 if n in fc.VOICE_NAMES and att.gains.get(i, 0.0) < -1e-9]
+    HAZARDS = {"siren", "car_horn", "gun_shot", "dog_bark"}
+    hazard_bad = [(n, att.gains[i]) for i, n in enumerate(att.classes)
+                  if n in HAZARDS and att.gains.get(i, 0.0) > -1e-9]
     n_freqs = config.N_FFT // 2 + 1
     band_space_ok = (att.head.mel["n_fft"] == fc.FILTER_N_FFT
                      and att.class_band.shape[1] == config.N_MELS
                      and n_freqs == fc.FILTER_N_FFT // 2 + 1)
-    ok = not bad and not wl_bad and band_space_ok
+    ok = not bad and not voice_bad and not hazard_bad and band_space_ok
     record("L0-3", "L0 信号链", "类增益按名字翻译 + 频带空间与 STFT 对齐", "hard", ok,
-           f"错位 {bad or '无'}｜白名单非 0 {wl_bad or '无'}｜"
+           f"错位 {bad or '无'}｜人声被压 {voice_bad or '无'}｜危险声未压 {hazard_bad or '无'}｜"
            f"head mel n_fft={att.head.mel['n_fft']} vs FILTER_N_FFT={fc.FILTER_N_FFT}",
            "频带空间错位会让 -12 dB 打在错误频段上，而听感上只是「降噪怪怪的」")
 
@@ -263,8 +268,13 @@ def check_carveout_floor(att: SpectralGateAttenuator, rows: list[dict]) -> None:
            "让位只在「高置信 × 强能量带」上生效，这是覆盖率的由来")
 
 
-def check_fail_open(att: SpectralGateAttenuator) -> None:
-    """后验全低于 apply_conf → 必须逐样本直通（fail-open 0 dB）。"""
+def check_gate_fallback(att: SpectralGateAttenuator) -> None:
+    """后验全低于 apply_conf → **不再直通**，按语音门控 fallback 衰减（V2）。
+
+    旧版这里是 fail-open 0 dB（"不猜不压"）。设计改成「除人声外全压」后，
+    认不出的声音必须也压 —— 否则脚步/键盘/鸟叫/交通全放进来，降噪等于没做。
+    白噪声会被 Silero VAD 判为非语音，因此应吃满 fallback。
+    """
     y = synth_white(2.0, seed=3)
     orig = att._resolve_probs
     try:
@@ -274,9 +284,10 @@ def check_fail_open(att: SpectralGateAttenuator) -> None:
     finally:
         att._resolve_probs = orig
     err = rel_db(out, y)
-    ok = err < -60.0 and abs(info["energy_delta_db"]) < 0.1
-    record("L1-4", "L1 行为", "低置信 → fail-open 直通（不猜不压）", "hard", ok,
-           f"重构误差 {err:.1f} dB｜记录能量变化 {info['energy_delta_db']:+.2f} dB")
+    ok = (info["energy_delta_db"] < -6.0) and att.stats["gate_fallback_frames"] > 0
+    record("L1-4", "L1 行为", "低置信 → 语音门控 fallback（不直通）", "hard", ok,
+           f"重构误差 {err:.1f} dB｜记录能量变化 {info['energy_delta_db']:+.2f} dB｜"
+           f"门控 fallback 帧 {att.stats['gate_fallback_frames']}")
 
 
 def check_anti_collapse(att: SpectralGateAttenuator) -> None:
@@ -392,10 +403,11 @@ def check_efficacy_and_boundary(att: SpectralGateAttenuator, rows: list[dict]) -
     record("L2-4", "L2 集成", "真实混合集：抑制确实发生（能力下限）", "hard", ok,
            f"n={len(rows)}｜Supp {supp_a.mean():+.2f} dB｜Pres {pres_a.mean():+.2f} dB"
            f"｜gap {supp_a.mean() - pres_a.mean():+.2f} dB｜触发 {100 * float(np.mean(supp_a < -1)):.0f}%")
-    record("L2-5", "L2 集成", "白名单红线超标率（能力边界，不过门）", "capability",
-           redline == 0.0,
-           f"{redline:.0f}% 样本 Pres < {fc.HARD_GATE_TOLERANCE_DB} dB",
-           "已定稿的负结论：抑制与保真互相拖累，gap 恒负 → 见 P1-9")
+    record("L2-5", "L2 集成", "危险声抑制覆盖率（设计目标：应当被压）", "capability",
+           redline >= 60.0,
+           f"{redline:.0f}% 样本 Pres < {fc.HARD_GATE_TOLERANCE_DB} dB（越高越符合设计）",
+           "2026-10-31 语义翻转：危险声靠触觉振动交付，耳机内本就该压掉。"
+           "旧口径「白名单红线 = 超标率」作废，同一数字的含义从「越少越好」翻成「越多越好」")
 
 
 def check_passthrough_mode(att: SpectralGateAttenuator, rows: list[dict]) -> None:
@@ -434,7 +446,7 @@ def main() -> int:
           f"α={att.strength}；真实样本 {len(rows)} 条\n")
 
     for fn in (check_identity, check_gain_table_translation, check_mel_to_linear,
-               check_fail_open, check_anti_collapse):
+               check_gate_fallback, check_anti_collapse):
         try:
             fn(att)
         except Exception as e:  # 功能测试自己崩了也要留证据

@@ -203,7 +203,11 @@ def layer3(n: int = 200) -> dict:
         with torch.no_grad():
             return F.softmax(head.model(mel), 1)[0].cpu().numpy()
 
-    wl_ids = [i for i, c in enumerate(config.TARGET_CLASSES) if c in fc.WHITELIST_NAMES]
+    # 历史口径快照：2026-10-31 语义翻转（除人声外全压）**之前**的白名单。
+    # 本脚本复现的是旧报告里的数字，绝不能跟着 filter_config 漂移 ——
+    # 否则「44% 白名单占比」这条历史事实会凭空消失，审计就不可溯源了。
+    LEGACY_WHITELIST = {"siren", "car_horn", "gun_shot", "dog_bark"}
+    wl_ids = [i for i, c in enumerate(config.TARGET_CLASSES) if c in LEGACY_WHITELIST]
     r3: dict = {"head_desc": vocab.describe(head),
                 "head4_classes": list(head.classes),
                 "grid": {}}

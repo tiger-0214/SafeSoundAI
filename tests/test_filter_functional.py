@@ -132,8 +132,13 @@ def test_zscore_frontend_matches_training(att, mix_row):
 
 
 # --------------------------------------------------------------------------- L1
-def test_fail_open_passes_through(att):
-    """所有类后验都低于 apply_conf → 逐样本直通（不猜不压）。"""
+def test_low_confidence_goes_fail_closed(att):
+    """所有类后验都低于 apply_conf → **不再直通**，按语音门控 fallback 衰减（V2）。
+
+    旧版这里是 fail-open 0 dB（"不猜不压"）。设计改成「除人声外全压」后，
+    认不出的声音必须也压 —— 否则脚步/键盘/鸟叫/交通全部原样进耳朵，
+    降噪等于没做。700 Hz 纯音会被 Silero VAD 判为非语音，因此吃满 fallback。
+    """
     y = _tone(700.0, 1.0)
     orig = att._resolve_probs
     try:
@@ -143,8 +148,9 @@ def test_fail_open_passes_through(att):
         out, info = att.process(y)
     finally:
         att._resolve_probs = orig
-    assert _rel_db(out, y) < -60.0
-    assert abs(info["energy_delta_db"]) < 0.1
+    assert info["energy_delta_db"] < -6.0, \
+        f"低置信帧仍被直通（V2 未生效）：Δ={info['energy_delta_db']} dB"
+    assert att.stats["gate_fallback_frames"] > 0, "没有帧走 gate fallback 分支"
 
 
 def test_anti_collapse_guard(att):

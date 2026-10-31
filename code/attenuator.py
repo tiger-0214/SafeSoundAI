@@ -23,6 +23,7 @@ import argparse
 import csv
 import warnings
 import json
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +41,29 @@ from mel import get_mel_transform
 warnings.filterwarnings('ignore', message='At least one mel filterbank')
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PROFILE_CACHE = fc.FILTER_REPORT_DIR / "class_spectral_profile.json"
+
+
+# ---------------------------------------------------------------------------
+# 0) 语音门控（V2）—— 让"未识别/分不清"的声音不再直通
+# ---------------------------------------------------------------------------
+@lru_cache(maxsize=1)
+def _load_silero_vad():
+    """加载 Silero VAD（首次会从 torch.hub 拉，之后走缓存）。
+
+    加载失败时返回 None，调用方退化为 fail-open（全放行）——部署现场宁可少衰减，
+    也不能因为拉不到模型就崩掉整条链。这条降级路径会在 stats 里留痕。
+    """
+    try:
+        model, _ = torch.hub.load(repo_or_dir="snakers4/silero-vad",
+                                  model="silero_vad", trust_repo=True,
+                                  onnx=False)
+        model.eval()
+        return model
+    except Exception as e:                                    # noqa: BLE001
+        warnings.warn(f"Silero VAD 不可用（{type(e).__name__}: {e}）→ 语音门控退化 "
+                      f"为 fail-open，全部帧按类增益处理", RuntimeWarning)
+        return None
+
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +156,8 @@ class SpectralGateAttenuator:
                            else bool(noise_conditional))
         self.stats = {"silent_suppression_events": 0, "over_suppression_events": 0,
                       "frames": 0, "hard_gate_windows": 0, "pass_frames": 0,
-                      "carveout_frames": 0}
+                      "carveout_frames": 0, "gate_fallback_frames": 0,
+                      "vad_chunks": 0, "vad_unavailable_frames": 0, "speech_frames": 0}
 
         # ---- AED 头：类名 / 类数 / mel 参数全部由检查点决定（vocab 是唯一入口）----
         self.head = vocab.load_aed(aed_ckpt, device=device)
@@ -221,7 +246,8 @@ class SpectralGateAttenuator:
         w = np.exp(probs_frames / fc.SOFTMAX_TEMPERATURE) * conf
         denom = np.maximum(w.sum(axis=1, keepdims=True), 1e-9)
         w = np.where(w.sum(axis=1, keepdims=True) > 0, w / denom, 0.0)   # (T, n_classes)
-        self.stats["pass_frames"] += int((w.sum(axis=1) == 0).sum())
+        no_conf = (w.sum(axis=1) == 0)
+        self.stats["pass_frames"] += int(no_conf.sum())
 
         g_db = np.zeros((config.N_MELS, T), dtype=np.float32)
         for cid in range(self.n_classes):
@@ -233,6 +259,12 @@ class SpectralGateAttenuator:
             else:
                 band = np.ones((config.N_MELS, 1), dtype=np.float32)
             g_db += (w[:, cid][None, :] * target) * band             # 能量带加权
+
+        if fc.SPEECH_GATE and no_conf.any():
+            # V2：置信度不足的帧**不再直通**（旧版 fail-open 0 dB = 降噪等于没做）。
+            # 先统一给 fallback，再由帧级语音门控把真正的语音帧抬回 0 dB。
+            g_db[:, no_conf] = float(fc.SPEECH_GATE_FALLBACK_DB)
+            self.stats["gate_fallback_frames"] += int(no_conf.sum())
 
         if self.carveout:
             # 让位强度 = 白名单类的逐帧置信度 × 该类能量带（只让出该类的频谱，不否决整帧）
@@ -257,6 +289,69 @@ class SpectralGateAttenuator:
             prev = prev + jump
             sm[:, t] = prev
         return sm
+
+    # -- 语音门控（V2）：帧级 VAD 调制（FILTER_HOP=10 ms 粒度） --
+    def voice_gate_frames(self, y: np.ndarray, n_frames: int) -> np.ndarray:
+        """返回 (n_frames,) ∈[0,1] 的语音保留权重（1 = 判为语音 → 增益抬回 0 dB）。
+
+        粒度跟 STFT 帧（10 ms），比 AED 的 0.5 s 窗细 50 倍 —— 这是「除人声外
+        全压」能在混合录音上真正生效的关键：窗级分类器说"这窗是 background"时，
+        窗内的语音帧仍会被这里单独放行，而不会被整窗放空。
+        """
+        if not fc.SPEECH_GATE:
+            return np.zeros(n_frames, dtype=np.float32)
+        vad = _load_silero_vad()
+        if vad is None:
+            self.stats["vad_unavailable_frames"] += int(n_frames)
+            return np.zeros(n_frames, dtype=np.float32)
+        if len(y) == 0 or n_frames <= 0:
+            return np.zeros(max(n_frames, 0), dtype=np.float32)
+
+        wav = torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
+        win = 512                                    # Silero v5 固定 512 @16k = 32 ms
+        n_chunks = int(np.ceil(len(wav) / win))
+        padded = torch.nn.functional.pad(wav, (0, n_chunks * win - len(wav)))
+        vad.reset_states()
+        probs = np.empty(n_chunks, dtype=np.float32)
+        with torch.no_grad():
+            for i in range(n_chunks):
+                probs[i] = float(vad(padded[i * win:(i + 1) * win], config.SAMPLE_RATE))
+        self.stats["vad_chunks"] += n_chunks
+
+        speech = (probs >= fc.VAD_THRESHOLD).astype(np.float32)
+        # 第 t 个 STFT 帧的中心时刻落在第几个 32 ms chunk
+        centers = np.arange(n_frames) * fc.FILTER_HOP + fc.FILTER_WIN // 2
+        idx = np.minimum(centers // win, n_chunks - 1)
+        g = speech[idx]
+        # 形态学保护带：前后各 SPEECH_GATE_MARGIN_MS，避免削掉字头字尾
+        frame_ms = 1000.0 * fc.FILTER_HOP / config.SAMPLE_RATE
+        k = int(round(fc.SPEECH_GATE_MARGIN_MS / frame_ms))
+        if k >= 1:
+            kernel = np.ones(2 * k + 1, dtype=np.float32)
+            g = (np.convolve(g, kernel, mode="same") > 0).astype(np.float32)
+        # 一阶平滑，避免硬切换产生咔哒
+        alpha = float(fc.SPEECH_GATE_SMOOTH)
+        sm = np.empty_like(g)
+        prev = float(g[0])
+        for t in range(len(g)):
+            prev = alpha * prev + (1.0 - alpha) * float(g[t])
+            sm[t] = prev
+        self.stats["speech_frames"] += int((sm > 0.5).sum())
+        return sm
+
+    def apply_voice_gate(self, g_db: np.ndarray, y: np.ndarray, T: int) -> np.ndarray:
+        """把帧级语音门控叠加到 (n_freq, T) 的线性 dB 增益上（V2）。
+
+        语音帧 → 抬回 ``SPEECH_GATE_HOLD_DB``；非语音帧 → 原样保留类增益
+        （类增益本身缺省时已由 ``gain_curve_db`` 填成 fallback，不是 0 dB）。
+        """
+        if not fc.SPEECH_GATE:
+            return g_db
+        gate = self.voice_gate_frames(y, T)
+        if not np.any(gate > 1e-3):
+            return g_db
+        hold = float(fc.SPEECH_GATE_HOLD_DB)
+        return g_db * (1.0 - gate[None, :]) + gate[None, :] * hold
 
     # -- 硬门（保守模式）：白名单类极高置信 → 该窗直通（filter_safety §2.1） --
     def hard_gate_mask(self, probs_frames: np.ndarray) -> np.ndarray:
@@ -311,6 +406,7 @@ class SpectralGateAttenuator:
         g = lin_gain_db[:, :T]
         if g.shape[1] < T:
             g = np.pad(g, ((0, 0), (0, T - g.shape[1])), mode="edge")
+        g = self.apply_voice_gate(g, y, T)          # V2：帧级语音门控（10 ms 粒度）
         gain = torch.from_numpy(10.0 ** (g / 20.0)).to(Y.dtype)
         Y2 = Y * gain
 
@@ -339,9 +435,14 @@ class SpectralGateAttenuator:
     def mask_from(self, y_ref: np.ndarray, oracle_class: int | None = None) -> np.ndarray:
         probs = self._resolve_probs(y_ref, oracle_class)
         mel_gain_db = self.gain_curve_db(probs)
-        lin = mel_to_linear_gain(mel_gain_db)
+        lin = mel_to_linear_gain(mel_gain_db)                        # (257, T_win)
         allow = self.hard_gate_mask(probs)
         lin[:, ~allow] = 0.0
+        # 与 process 同口径：先 pad 到完整 STFT 帧数，再叠帧级语音门控
+        T = 1 + len(y_ref) // fc.FILTER_HOP
+        if lin.shape[1] < T:
+            lin = np.pad(lin, ((0, 0), (0, T - lin.shape[1])), mode="edge")
+        lin = self.apply_voice_gate(lin, y_ref, lin.shape[1])
         return 10.0 ** (lin / 20.0)                                  # (257,T)
 
     @staticmethod
