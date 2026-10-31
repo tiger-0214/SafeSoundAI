@@ -46,7 +46,7 @@ Every path resolves from `config.py`; override the preprocessed-data root with `
 
 | File | Role |
 |:--|:--|
-| `filter_config.py` | per-class gain tables **declared by class name**, user profiles, hard safety constraints |
+| `filter_config.py` | per-class gain tables **declared by class name**, user profiles, hard safety constraints. `background` semantics: it means *"none of the three hazards"*, **not** "quiet" — it absorbs AC hum, drills, barking and children playing, so it is never attenuated (R1), never boosted (R2) and never whitelisted (R3); `background_gain_guard()` enforces this at runtime, `gains_for(..., strict=True)` fails CI on an unknown head |
 | `attenuator.py` | spectral-gate attenuation (per-window z-score + whitelist spectral carve-out) |
 | `tse_model.py` / `train_tse.py` | conditional target-speech-enhancement denoiser |
 | `filter_pipeline.py` | streaming attenuation with fail-open on low confidence |

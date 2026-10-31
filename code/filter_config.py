@@ -12,9 +12,26 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from pathlib import Path
 
 import config
+
+# ---------------------------------------------------------------------------
+# 「background」到底是什么 —— 这一节写死语义，避免三个模块各理解一套
+# ---------------------------------------------------------------------------
+# 4 类部署头里 ``background`` 不是"安静"，而是**"不是那三种危险声"**：
+# 空调、电钻、狗叫、儿童嬉闹、街道音乐全在同一个格子里。由此推出三条硬规则：
+#
+#   R1. background **永远不给负增益**。对它下 -12 dB 等于连狗叫、儿童喊叫一起压掉，
+#       而这两类恰是聋人需要知道的。分不清就别动 —— fail-open 0 dB。
+#   R2. background **永远不给正增益**。enhance 只对白名单生效；放大环境底噪
+#       只会把信噪比推向更差（这正是"助听器放大一切"的老毛病）。
+#   R3. background **不进白名单**。白名单是"绝不抑制"的意思，
+#       而 background 在 4 类头里本来就得不到任何增益，列进去只会误导读者。
+#
+# 想真正衰减空调/电钻，必须交给 10 类头（filter 支路），由它把类别拆开再说。
+# 这就是 gains_for() 遇到语义表里没有的类名时回落到 0 dB 的全部理由。
 
 # ---------------------------------------------------------------------------
 # 语义三表（filter_spec.md §二）—— class_id 与 config.TARGET_CLASSES 对齐
@@ -98,17 +115,59 @@ def class_gains(profile: str | None = None) -> dict[int, float]:
     return dict(get_profile(profile)["gains"])
 
 
-def gains_for(classes: list[str] | tuple[str, ...], profile: str | None = None) -> dict[int, float]:
+_WARNED_HEADS: set[tuple[str, ...]] = set()
+
+
+def gains_for(
+    classes: list[str] | tuple[str, ...],
+    profile: str | None = None,
+    *,
+    strict: bool = False,
+    warn: bool = True,
+) -> dict[int, float]:
     """把档位增益翻译到**任意 AED 头空间**：返回 {该头空间的 class_id: dB}。
+
+    规则（与文件顶部的 R1–R3 一致）：
 
     * 语义表里有该类 → 取该档位增益；
     * 语义表里没有（最典型是 4 类头的 ``background``）→ **0 dB**，即
-      「该头分不清的类别一律不衰减」（fail-open）。理由：4 类头的 background
-      同时装了空调/电钻/狗叫/儿童嬉闹，对它下负增益必然误伤安全类，
-      宁可交给 10 类头去区分。详见 reports/filter_ab_report.md §二。
+      「该头分不清的类别一律不衰减」（fail-open）。
+
+    `strict=True` 时改为抛 `KeyError`：给 CI / 单元测试用，能立刻抓出
+    "换了头却没换语义表"这种静默错配。运行时不要开 strict —— 部署现场
+    因为出现一个新类名就崩掉，比少衰减一类糟得多。
+
+    `warn=True` 时对每个新遇到的未知头**只告警一次**（`_WARNED_HEADS` 去重），
+    否则流式循环里每 250 ms 刷一条，日志会被淹掉。
     """
     by_name = get_profile_names(profile)["gains"]
+    unknown = [n for n in classes if n not in by_name]
+    if unknown:
+        key = tuple(classes)
+        msg = (f"类名 {unknown} 不在声学语义表里 → 这些类按 0 dB 处理（fail-open）。"
+               f"当前头空间 {list(classes)}。若这是 4 类头的 background，属预期；"
+               f"若是别的头，说明语义表没跟上。")
+        if strict:
+            raise KeyError(msg)
+        if warn and key not in _WARNED_HEADS:
+            _WARNED_HEADS.add(key)
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
     return {i: float(by_name.get(n, 0.0)) for i, n in enumerate(classes)}
+
+
+def background_gain_guard(classes: list[str] | tuple[str, ...],
+                          gains: dict[int, float]) -> None:
+    """R1/R2 的运行时断言：background 的增益必须恰好 0 dB。
+
+    任何档位、任何头空间，只要 background 拿到非 0 增益就说明语义表被改坏了
+    （负增益会误伤狗叫/儿童，正增益会抬底噪）。放在这里而不是测试里，
+    是因为它同时保护部署路径。
+    """
+    for i, n in enumerate(classes):
+        if n == "background" and abs(gains.get(i, 0.0)) > 1e-9:
+            raise AssertionError(
+                f"background 必须 0 dB（R1/R2），实测 {gains[i]:+.2f} dB；"
+                f"档位增益表被改坏了")
 
 
 def whitelist_ids_in(classes: list[str] | tuple[str, ...]) -> frozenset[int]:
