@@ -88,15 +88,18 @@ mic ──┬─► AED  (detect → decide → haptic code)        safety branc
       └─► denoiser (conditional TSE + safety gate)    comfort branch, opt-in
 ```
 
-The detection branch never waits on the denoiser, and the denoiser can never remove a whitelisted hazard class — the safety gate is hard-coded, not tuned.
+The detection branch never waits on the denoiser, and the denoiser never relies on a class list to decide what is safe — the safety gate is hard-coded, not tuned.
+
+> **Semantics changed in V2 (current).** The denoiser used to *protect* hazards (whitelist, 0 dB) and let unrecognised sound through (fail-open). It now does the opposite: **everything that is not the wearer's voice is attenuated**, hazards included, and unrecognised sound is **fail-closed**. Hazard awareness is carried by the haptic channel, which is why the raw siren can be 12 dB down and still be reported. A frame-level Silero VAD gate lifts the gain back to 0 dB wherever speech is present, so the only class guaranteed 0 dB is `children_playing` (the one that carries speech). Measured on 20 speech+noise mixtures: non-speech suppression **−7.22 dB**, STOI **0.822 → 0.818**, speech-band energy **−0.15 dB** (`eval_speech_preservation.py`).
 
 | Script | Role |
 |:--|:--|
 | `code/filter_config.py` | per-class gain tables, user profiles, hard safety constraints |
-| `code/attenuator.py` | spectral-gate attenuation driven by instance segmentation |
+| `code/attenuator.py` | spectral-gate attenuation driven by instance segmentation, plus VAD speech gate |
 | `code/tse_model.py` / `code/train_tse.py` | conditional target-speech-enhancement denoiser |
-| `code/filter_pipeline.py` | streaming attenuation with fail-open on low confidence |
+| `code/filter_pipeline.py` | streaming attenuation with gate-fallback on low confidence |
 | `code/synth_mix.py` | signal-level mix builder for reproducible filter tests |
+| `code/make_speech_mixtures.py` | builds the speech + noise training set (clean speech vs everything non-speech) |
 | `code/dual_path_pipeline.py` | both branches over one stream |
 | `code/realtime_demo.py` | PC real-time loop, mic in, haptic pattern out |
 
@@ -108,7 +111,8 @@ The detection branch never waits on the denoiser, and the denoiser can never rem
 |:--|:--|
 | `code/data_audit.py` | composition, integrity, silence and leakage audits |
 | `code/preprocess_verify.py` | 11-point verification of the segment pipeline |
-| `code/eval_filter.py` | attenuation effect: SNR change vs whitelist preservation |
+| `code/eval_filter.py` | attenuation effect: class-stem SNR change vs hazardous-sound preservation (legacy framing, kept for number provenance) |
+| `code/eval_speech_preservation.py` | the V2 scoreboard: non-speech suppression + speech preservation (SI-SDR gain / STOI / speech-band energy) |
 | `code/ablate_filter.py` | 2 x 2 ablation (input normalisation x whitelist protection) |
 | `code/gen_ab_demo.py` | audible before/after pairs, with target and interferer stems written separately |
 

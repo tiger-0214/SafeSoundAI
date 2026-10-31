@@ -48,12 +48,14 @@ Every path resolves from `config.py`; override the preprocessed-data root with `
 
 | File | Role |
 |:--|:--|
-| `filter_config.py` | per-class gain tables **declared by class name**, user profiles, hard safety constraints. `background` semantics: it means *"none of the three hazards"*, **not** "quiet" — it absorbs AC hum, drills, barking and children playing, so it is never attenuated (R1), never boosted (R2) and never whitelisted (R3); `background_gain_guard()` enforces this at runtime, `gains_for(..., strict=True)` fails CI on an unknown head |
-| `attenuator.py` | spectral-gate attenuation (per-window z-score + whitelist spectral carve-out) |
+| `filter_config.py` | per-class gain tables **declared by class name**, user profiles, hard safety constraints. **V2 semantics (current)**: everything that is not the wearer's own voice gets attenuated — hazards included (`siren`/`car_horn`/`gun_shot`/`dog_bark` at −12 dB), because a binaural cue-preserving cue is delivered by the haptic channel, not by keeping the raw sound. The only 0 dB class is `children_playing` (the one class that carries speech). Unknown/unrecognised input is **fail-closed** at `SPEECH_GATE_FALLBACK_DB` (−12), gated by VAD so speech never dies: V1 voice is never attenuated, V2 unattested sound defaults to attenuation, V3 every attenuation is floor-limited. `background_gain_guard()` rejects positive gain *and* over-deepening; `gains_for(..., strict=True)` fails CI on an unknown head |
+| `attenuator.py` | spectral-gate attenuation (per-window z-score) + Silero VAD frame-level speech gate (`voice_gate_frames` / `apply_voice_gate`) that lifts the gain back to 0 dB wherever speech is present |
 | `tse_model.py` / `train_tse.py` | conditional target-speech-enhancement denoiser |
-| `filter_pipeline.py` | streaming attenuation with fail-open on low confidence |
+| `filter_pipeline.py` | streaming attenuation with **gate-fallback** on low confidence (was fail-open before V2) |
 | `synth_mix.py` | signal-level mix builder for reproducible tests |
-| `eval_filter.py` | measured attenuation vs whitelist preservation |
+| `make_speech_mixtures.py` | builds the **speech + noise** pairing set (LibriSpeech clean speech vs everything non-speech). Distinct from `4_Synthetic_Mixtures`, whose targets are *noise classes* — that set evaluates, this one trains; never swap them |
+| `eval_filter.py` | class-stem attenuation vs hazardous-sound preservation (legacy framing, kept for number provenance) |
+| `eval_speech_preservation.py` | **the V2 scoreboard** — non-speech suppression (dB) + speech preservation (SI-SDR gain, STOI, speech-band energy) |
 | `ablate_filter.py` | 2x2 ablation (z-score / carve-out) on the real mixture set → `filter_ablation.md` |
 | `gen_ab_demo.py` | audible before/after pairs with separate target / interferer stems |
 | `audit_detection_numbers.py` | provenance audit for the **detection** side: writes one CSV of per-segment predictions (the only raw layer), derives every summary number from it with a single `summarize()` function, and `--check` runs 29 assertions across completeness / segment / recording / weight-anchor layers. Exit code is CI-usable. Scope is the 4-class deployment head only — the v3 multi-label numbers are audited elsewhere and the two must never be cross-quoted |
