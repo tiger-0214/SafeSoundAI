@@ -137,8 +137,8 @@ def layer2(art: dict) -> dict:
     # 报告文字 vs json（这才是「文档里的数字」）
     report = art["report"].read_text(encoding="utf-8") if art["report"].exists() else ""
     for label, val, tol in [
-        ("A 部署 Supp −4.06", js["A"]["supp_db_mean"], 5e-3),
-        ("A 部署 Pres −3.32", js["A"]["pres_db_mean"], 5e-3),
+        ("A 部署 Supp −3.85", js["A"]["supp_db_mean"], 5e-3),
+        ("A 部署 Pres −3.36", js["A"]["pres_db_mean"], 5e-3),
         ("B Supp −13.89", js["B"]["supp_db_mean"], 5e-3),
         ("B Pres −9.58", js["B"]["pres_db_mean"], 5e-3),
     ]:

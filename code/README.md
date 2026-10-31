@@ -80,7 +80,7 @@ Every path resolves from `config.py`; override the preprocessed-data root with `
 
 ## Tests
 
-`tests/` (pytest, 56 cases) covers the parts where a silent bug is invisible in the output
+`tests/` (pytest, 80 cases) covers the parts where a silent bug is invisible in the output
 numbers: actuator code-table consistency with the encoder, backend emit-time alignment,
 scheduler invariants under 3 seeds × 10 000 random commands, resampler chunk-vs-whole
 equivalence, ring-buffer random-window equivalence, **and the audit gates themselves** —

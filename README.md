@@ -16,7 +16,7 @@ export SAFESOUND_DATA_DIR=/path/to/preprocessed_data   # only for the data-depen
 
 make demo        # offline: audio → window → model → haptic code, no dataset needed
 make demo-e2e    # streaming: health check → real-audio scene → haptics → event-level score
-make test        # 56 pytest cases
+make test        # 80 pytest cases
 make check       # provenance gates for the filter and detection numbers (CI-usable)
 make onnx        # fp32 + int8 export with an accuracy gate
 make stream      # 30 min streaming soak test

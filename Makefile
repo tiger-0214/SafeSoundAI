@@ -6,8 +6,8 @@
 #   make            # 等价 make help
 #   make demo       # 离线 v3 demo，**不需要数据集**（最快看到触觉编码长什么样）
 #   make demo-e2e   # 流式端到端：造场景 → 检测 → 决策 → 触觉 → 事件级评分
-#   make test       # 全部 pytest（56 项）
-#   make check      # 数字门禁：过滤侧 + 检测侧（秒级，可直接进 CI）
+#   make test       # 全部 pytest（80 项）
+#   make check      # 门禁：过滤侧功能契约 + 两侧数字溯源（秒级，可直接进 CI）
 #   make onnx       # 导出 fp32 / int8 并做精度回归
 #   make stream     # 30 min 流式压测模板
 #   make clean      # 清临时产物（不动权重与报告）
@@ -16,7 +16,7 @@ PY ?= python3
 export SAFESOUND_DATA_DIR ?= /root/safesound_data
 SCENE30 := /tmp/scene30min.wav
 
-.PHONY: help all demo demo-e2e test check check-filter check-detection onnx stream scene30 clean
+.PHONY: help all demo demo-e2e test check check-filter check-detection functional onnx stream scene30 clean
 
 help:
 	@echo "make demo        离线 v3 demo（无数据集也能跑）"
@@ -44,7 +44,12 @@ test:
 # ---------------------------------------------------------------- 门禁
 check: check-filter check-detection
 
-check-filter:
+# 先跑功能契约（信号链是否按设计工作），再跑数字溯源（报告里的数是否可复算）。
+# 顺序有意义：功能挂了三分钟就能定位是实现 bug 还是能力边界，不用等审计跑完。
+functional:
+	@$(PY) code/filter_functional_check.py --n 20 | tail -4
+
+check-filter: functional
 	@echo "=== 过滤侧数字门禁 ==="
 	@$(PY) code/audit_filter_numbers.py --ablate | tail -3
 

@@ -85,13 +85,22 @@ def mel_to_linear_gain(mel_gain_db: np.ndarray, n_freqs: int = config.N_FFT // 2
     """
     mel_gain_db : (n_mels,) 或 (n_mels, T)
     返回        : (n_freqs,) 或 (n_freqs, T) 的 dB 增益，用 mel 滤波器组权重插值。
+
+    .. warning::
+       必须按**频点行**归一化（加权平均），不能只按 mel 列归一化。
+       一个线性频点通常被 2 个 mel 滤波器覆盖，只做列归一化会让重叠区的
+       增益被叠加：mel 域写 -12 dB，作用到线性频点上是 -24 dB
+       （2026-10-31 功能测试 L0-4 抓到的实现级 bug，见
+       ``outputs/reports/filter_functional.md``）。
     """
     fb = torchaudio.functional.melscale_fbanks(
         n_freqs=n_freqs, f_min=config.F_MIN, f_max=config.F_MAX,
         n_mels=config.N_MELS, sample_rate=config.SAMPLE_RATE,
         norm=None, mel_scale="htk",
     ).numpy()                                        # (n_freqs, n_mels)
-    w = fb / np.maximum(fb.sum(axis=0, keepdims=True), 1e-9)
+    col = fb / np.maximum(fb.sum(axis=0, keepdims=True), 1e-9)   # 每个 mel 滤波器内部归一
+    row = col.sum(axis=1, keepdims=True)                         # 每个频点被几个 mel 覆盖
+    w = col / np.maximum(row, 1e-9)                              # → 加权平均权重（行和=1）
     return w @ mel_gain_db
 
 
