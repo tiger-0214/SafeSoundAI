@@ -31,6 +31,8 @@ import config
 import filter_config as fc
 from attenuator import SpectralGateAttenuator
 from tse_model import istft, stft
+import spectral_subtraction as ss
+from spectral_subtraction import SpectralSubParams as SSP
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 OUT = Path(__file__).resolve().parent.parent / "outputs" / "reports"
@@ -72,6 +74,13 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--split", default="smoke")
     ap.add_argument("--profile", default=fc.DEFAULT_PROFILE)
+    ap.add_argument("--backend", default="semantic",
+                    choices=["semantic", "spectral", "both"],
+                    help="semantic=AED 语义增益｜spectral=VAD 调制谱减｜both=逐点取小")
+    ap.add_argument("--alpha-noise", type=float, default=8.0)
+    ap.add_argument("--alpha-speech", type=float, default=4.0)
+    ap.add_argument("--beta-speech", type=float, default=0.08)
+    ap.add_argument("--beta-noise", type=float, default=0.003)
     args = ap.parse_args()
 
     man = SPEECH_MIX / args.split / "manifest.csv"
@@ -79,8 +88,33 @@ def main() -> None:
         raise SystemExit(f"找不到 {man}，先跑 make_speech_mixtures.py")
     rows = list(csv.DictReader(open(man, encoding="utf-8")))[:args.n]
 
-    att = SpectralGateAttenuator(profile=args.profile)
-    print(f"profile={args.profile}｜样本 {len(rows)}｜mix 根 {SPEECH_MIX / args.split}")
+    # 谱减由本脚本按 --backend 显式控制，attenuator 侧关掉以免重复叠加
+    att = SpectralGateAttenuator(profile=args.profile, spectral=False)
+    spec_p = SSP(alpha_noise=args.alpha_noise, alpha_speech=args.alpha_speech,
+                 beta_speech=args.beta_speech,
+                 beta_noise=args.beta_noise) if args.backend != "semantic" else None
+    print(f"profile={args.profile}｜backend={args.backend}｜样本 {len(rows)}｜"
+          f"mix 根 {SPEECH_MIX / args.split}")
+
+    def mask_for(y: np.ndarray) -> np.ndarray:
+        """按 backend 返回线性增益 (F,T)。三种后端共享同一 STFT 口径。"""
+        sem_db = None
+        spec_db = None
+        if args.backend in ("semantic", "both"):
+            sem_db = 20.0 * np.log10(np.maximum(att.mask_from(y), 1e-6))
+        if args.backend in ("spectral", "both"):
+            Y = ss._stft(y, spec_p)
+            power = (Y.abs() ** 2).numpy()
+            vad = ss._align_vad(att.voice_gate_frames(y, power.shape[1]), power.shape[1])
+            spec_db, _ = ss.vad_modulated_gain(power, vad, spec_p)
+        if args.backend == "both":
+            db_mat = ss.combine_gain_db(sem_db, spec_db)
+        elif sem_db is not None:
+            db_mat = sem_db
+        else:
+            db_mat = spec_db
+        return np.power(10.0, db_mat / 20.0).astype(np.float32)
+
 
     per: list[dict] = []
     t0 = time.perf_counter()
@@ -90,12 +124,12 @@ def main() -> None:
         mix = load(r["mix_path"])
 
         # ---- E1：纯噪声输入，应该被压 ----
-        m_n = att.mask_from(noise)
+        m_n = mask_for(noise)
         out_n = apply_mask(noise, m_n)
         supp = db(np.mean(out_n ** 2) / (np.mean(noise ** 2) + 1e-12))
 
         # ---- E2：mix 输入，人声应保留 ----
-        m_m = att.mask_from(mix)
+        m_m = mask_for(mix)
         out_m = apply_mask(mix, m_m)
         n = min(len(out_m), len(clean))
         o, c = out_m[:n], clean[:n]
@@ -131,6 +165,7 @@ def main() -> None:
     summary = {
         "n": len(per),
         "profile": args.profile,
+        "backend": args.backend,
         "E1_noise_supp_db_mean": mean("E1_noise_supp_db"),
         "E2_sisdr_imp_mean": mean("E2_sisdr_imp"),
         "E2_stoi_in_mean": mean("E2_stoi_in"),
