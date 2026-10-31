@@ -102,6 +102,7 @@ class DualPathPipeline:
         self.device = device
         self.threshold = threshold
         self.aed_ckpt = ckpt
+        # 仲裁引擎的类别表必须**在头加载后**绑定（vocab 铁律）；见 _bind_engine_classes()
         self.engine = DecisionEngine(confidence_threshold=threshold)
         self.state = PipelineState()
         self._model = model          # 可直接注入 AEDHead（vocab.load_aed 的返回）
@@ -127,7 +128,24 @@ class DualPathPipeline:
                 return None                      # 无权重 → 只跑电平/降噪支路
             self.device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
             self._model = vocab.load_aed(path, device=self.device)
+        self._bind_engine_classes()
         return self._model
+
+    def _bind_engine_classes(self) -> None:
+        """把仲裁引擎的类别表钉到**实际产 logits 的那个头**上。
+
+        历史缺陷（本次修复）：`DecisionEngine` 默认用 4 类产品头，但如果加载的是
+        10 类 legacy `ds_cnn_best.pth`，`arbitrate()` 会对 class_id >= 4 执行
+        `self.classes[class_id]` -> IndexError；反过来 4 类头用 10 类表反查时，
+        `siren(0)` 会被读成 `air_conditioner`（静默错位，比崩溃更糟）。
+        也就是说：类别表不匹配时整条触觉链要么崩、要么给出错误的紧迫度。
+        """
+        h = self._model
+        if h is None:
+            return
+        classes = list(getattr(h, "classes", []) or [])
+        if classes and list(self.engine.classes) != classes:
+            self.engine.classes = classes
 
     @property
     def model(self):

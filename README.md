@@ -12,15 +12,20 @@ This repository is the **code**: the detection model, the haptic encoder, the pa
 
 ```bash
 pip install -r code/requirements.txt
+export SAFESOUND_DATA_DIR=/path/to/preprocessed_data   # only for the data-dependent targets
 
-# data root for anything that reads segments (not needed by the demo)
-export SAFESOUND_DATA_DIR=/path/to/preprocessed_data
-
-python3 code/demo.py --ckpt /path/to/dscnn_4cls.pt         # built-in scene
-python3 code/demo.py --ckpt /path/to/dscnn_4cls.pt --wav street.wav
+make demo        # offline: audio → window → model → haptic code, no dataset needed
+make demo-e2e    # streaming: health check → real-audio scene → haptics → event-level score
+make test        # 56 pytest cases
+make check       # provenance gates for the filter and detection numbers (CI-usable)
+make onnx        # fp32 + int8 export with an accuracy gate
+make stream      # 30 min streaming soak test
 ```
 
-`code/demo.py` prints one row per detected event — time, class, urgency, haptic pattern, interval, amplitude, code:
+`make demo` needs nothing but the checkpoint; `make demo-e2e` checks the environment first and
+tells you exactly what is missing instead of failing halfway.
+
+`make demo` prints one row per detected event — time, class, urgency, haptic pattern, interval, amplitude, code:
 
 ```
  t(s) class     urgency   pattern    interval  amplitude  code
