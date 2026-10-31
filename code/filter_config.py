@@ -70,12 +70,31 @@ NEUTRAL_NAMES = VOICE_NAMES                            # 向后兼容别名
 # Silero VAD 逐帧判定；语音帧抬回 SPEECH_GATE_HOLD_DB，非语音帧按 fallback 衰减。
 # 前后各留 SPEECH_GATE_MARGIN_MS 保护带，否则字头字尾会被削掉（听感上是"断续"）。
 SPEECH_GATE = True
-SPEECH_GATE_FALLBACK_DB = -12.0                       # 非语音帧衰减量
+SPEECH_GATE_FALLBACK_DB = -18.0                       # 非语音帧衰减量
 SPEECH_GATE_HOLD_DB = 0.0                             # 语音帧增益
 SPEECH_GATE_MARGIN_MS = 150.0                         # 语音判定前后保护带
 SPEECH_GATE_MIN_SILENCE_MS = 100.0                    # 短于此的非语音空洞不压（防抖）
 VAD_THRESHOLD = 0.5                                   # Silero 语音概率阈值
 SPEECH_GATE_SMOOTH = 0.6                              # 门控一阶平滑（越大越软）
+# VAD 否决权（V2.1）：门控判"这里没有说话"时，类增益若仍高于此值
+# （≈ 没被压），拉到 fallback。阈值取 −1 dB 是为了只补"漏压"
+# （人声类免死金牌 / 未匹配到任何抑制类），不动已明确判定的档位增益。
+SPEECH_GATE_LEAK_EPS_DB = -1.0
+
+# --- 谱减（A 路线，2026-11-01）：在语义增益之上叠一层逐时频点降噪 ------------
+# 语义门控是二值的（整帧放行 / 整帧压掉），VAD 判为语音的那 10 ms 帧里，
+# 稳态噪声原样进入耳朵。谱减按「这个 bin 里有多少是噪声」逐点减，补上这个洞。
+# 两者逐点取小合并：语义兜底整窗，谱减精修语音帧内部。
+# 参数由 sweep_spectral_params.py 在 20 条配对集上选出（见
+# outputs/reports/spectral_sweep.md），选点约束是
+# 「E1 ≤ −18 dB 且 STOI 掉 ≤0.003 且语音段能量 ≥ −1.2 dB」。
+SPECTRAL_SUBTRACTION = True
+SPECTRAL_ALPHA_NOISE = 8.0        # 无语音帧过减因子（激进）
+SPECTRAL_ALPHA_SPEECH = 4.0       # 语音帧过减因子（保守）
+SPECTRAL_BETA_SPEECH = 0.08       # 语音帧幅度谱底（−22 dB）
+SPECTRAL_BETA_NOISE = 0.003       # 非语音帧幅度谱底（−50 dB）
+SPECTRAL_SMOOTH_PS_FRAMES = 5     # 功率谱时间平滑帧数（压指数分布方差）
+SPECTRAL_CAUSAL_NOISE = True      # 噪声估计只用过去帧（流式对齐）
 # 4 类头 background 显式声明为「门控类」（它分不出空调/电钻/狗叫/儿童喊叫）
 SPEECH_GATED_NAMES = {"background": SPEECH_GATE_FALLBACK_DB}
 

@@ -141,7 +141,8 @@ class SpectralGateAttenuator:
                  zscore_windows: bool | None = None,
                  carveout: bool | None = None,
                  strength: float | None = None,
-                 noise_conditional: bool | None = None):
+                 noise_conditional: bool | None = None,
+                 spectral: bool | None = None):
         self.profile = fc.get_profile(profile)
         self.profile_name = profile
         self.max_att = float(self.profile["max_total_attenuation_db"])
@@ -157,7 +158,25 @@ class SpectralGateAttenuator:
         self.stats = {"silent_suppression_events": 0, "over_suppression_events": 0,
                       "frames": 0, "hard_gate_windows": 0, "pass_frames": 0,
                       "carveout_frames": 0, "gate_fallback_frames": 0,
-                      "vad_chunks": 0, "vad_unavailable_frames": 0, "speech_frames": 0}
+                      "vad_chunks": 0, "vad_unavailable_frames": 0, "speech_frames": 0,
+                      "spectral_frames": 0}
+        # A 路线：谱减后端。参数来自 filter_config（由 sweep 选出），
+        # 关掉时行为与纯语义门控完全一致。
+        self.spectral = (bool(fc.SPECTRAL_SUBTRACTION) if spectral is None
+                         else bool(spectral))
+        if self.spectral:
+            import spectral_subtraction as ss
+            self.ss = ss
+            self.spec_params = ss.SpectralSubParams(
+                alpha_noise=fc.SPECTRAL_ALPHA_NOISE,
+                alpha_speech=fc.SPECTRAL_ALPHA_SPEECH,
+                beta_speech=fc.SPECTRAL_BETA_SPEECH,
+                beta_noise=fc.SPECTRAL_BETA_NOISE,
+                smooth_ps_frames=fc.SPECTRAL_SMOOTH_PS_FRAMES,
+                causal_noise=fc.SPECTRAL_CAUSAL_NOISE,
+                max_atten_db=-self.max_att,
+            )
+        self._last_gate: np.ndarray | None = None
 
         # ---- AED 头：类名 / 类数 / mel 参数全部由检查点决定（vocab 是唯一入口）----
         self.head = vocab.load_aed(aed_ckpt, device=device)
@@ -302,8 +321,11 @@ class SpectralGateAttenuator:
             return np.zeros(n_frames, dtype=np.float32)
         vad = _load_silero_vad()
         if vad is None:
+            # 不可用时置位，让 apply_voice_gate 放弃否决权（fail-open，退回 V1）
+            self._vad_ok = False
             self.stats["vad_unavailable_frames"] += int(n_frames)
             return np.zeros(n_frames, dtype=np.float32)
+        self._vad_ok = True
         if len(y) == 0 or n_frames <= 0:
             return np.zeros(max(n_frames, 0), dtype=np.float32)
 
@@ -326,9 +348,14 @@ class SpectralGateAttenuator:
         # 形态学保护带：前后各 SPEECH_GATE_MARGIN_MS，避免削掉字头字尾
         frame_ms = 1000.0 * fc.FILTER_HOP / config.SAMPLE_RATE
         k = int(round(fc.SPEECH_GATE_MARGIN_MS / frame_ms))
-        if k >= 1:
+        if k >= 1 and len(g) > 0:
             kernel = np.ones(2 * k + 1, dtype=np.float32)
-            g = (np.convolve(g, kernel, mode="same") > 0).astype(np.float32)
+            # ⚠️ 不能用 mode="same"：numpy 在 len(kernel) > len(g) 时返回
+            # max(M,N) 长度，短音频（< 2×MARGIN）会让门控数组比增益多出
+            # 十几个元素，广播时直接 ValueError。先补边再 valid 卷积，
+            # 输出长度恒等于 len(g)。
+            g = (np.convolve(np.pad(g, k, mode="constant"), kernel,
+                             mode="valid") > 0).astype(np.float32)
         # 一阶平滑，避免硬切换产生咔哒
         alpha = float(fc.SPEECH_GATE_SMOOTH)
         sm = np.empty_like(g)
@@ -340,18 +367,65 @@ class SpectralGateAttenuator:
         return sm
 
     def apply_voice_gate(self, g_db: np.ndarray, y: np.ndarray, T: int) -> np.ndarray:
-        """把帧级语音门控叠加到 (n_freq, T) 的线性 dB 增益上（V2）。
+        """把帧级语音门控叠加到 (n_freq, T) 的线性 dB 增益上（V2.1）。
 
-        语音帧 → 抬回 ``SPEECH_GATE_HOLD_DB``；非语音帧 → 原样保留类增益
-        （类增益本身缺省时已由 ``gain_curve_db`` 填成 fallback，不是 0 dB）。
+        语音帧 → 抬回 ``SPEECH_GATE_HOLD_DB``（VAD 的**放行权**）。
+        非语音帧 → 类增益不得高于 fallback（VAD 的**否决权**）。
+
+        V2.1 修正（2026-10-31 晚）：旧版对非语音帧「原样保留类增益」，看似合理，
+        实则留了免死金牌 —— 人声类 ``children_playing`` 的类增益本身就是 0 dB，
+        于是一条噪声只要被 AED 误判成人声类，就完全不被压。comfort 档 20 条
+        实测有 4 条抑制量恰好是 -0.0 dB（一粒都没压），全部出自这个洞。
+
+        语义收紧：V1 的「人声**类**永不抑制」→ V2.1 的「人**在说话的帧**永不抑制」。
+        没有语音的人声类帧本来就没有可保护的内容，压它不损失可懂度。
+
+        VAD 不可用时 fail-open（``_vad_ok=False``）→ 退回纯类增益，即 V1 行为：
+        宁可吵，也不能因为检测器挂了而把用户唯一能听懂的东西压掉。
         """
         if not fc.SPEECH_GATE:
             return g_db
         gate = self.voice_gate_frames(y, T)
+        self._last_gate = gate                      # 供谱减复用，避免重复跑 Silero
+        if not getattr(self, "_vad_ok", True):
+            return g_db                              # VAD 挂了 → 不启用否决
+        fb = float(fc.SPEECH_GATE_FALLBACK_DB) * self.strength
+        # 安全强度旋钮对门控同样生效：strength=0 表示"关闭降噪"，此时否决权
+        # 必须一并不生效，否则会绕过 gain_curve_db 里的收缩。
+        eps = float(fc.SPEECH_GATE_LEAK_EPS_DB)
+        veto = np.clip(1.0 - gate, 0.0, 1.0)[None, :]
+        if veto.any():
+            # 否决权只补「漏压」：类增益仍接近 0 dB 的帧（人声类免死金牌、
+            # 或没有任何抑制类匹配上）才拉到 fallback。已明确判成 siren −12
+            # 的帧保持 −12 —— 那是档位选择，不是漏洞。用 min(g_db, fb) 会把
+            # fallback 变成上限，让 ptsd_default 的 −12 全被拉到 −18，档位形同虚设。
+            target = np.where(g_db > eps, fb, g_db)
+            g_db = g_db * (1.0 - veto) + target * veto
+        # ② 放行权：语音帧抬回 hold
         if not np.any(gate > 1e-3):
             return g_db
         hold = float(fc.SPEECH_GATE_HOLD_DB)
         return g_db * (1.0 - gate[None, :]) + gate[None, :] * hold
+
+    def overlay_spectral(self, g_db: np.ndarray, Y, T: int) -> np.ndarray:
+        """在语义 dB 增益上叠加 VAD 调制谱减（A 路线），逐点取小。
+
+        Y 是已经算好的复频谱 —— 复用它可以省掉第二次 STFT。VAD 权重取自
+        ``apply_voice_gate`` 缓存的那一份，不让 Silero 跑两遍。
+        """
+        if not self.spectral:
+            return g_db
+        ss = self.ss
+        power = (Y.abs() ** 2).numpy().astype(np.float64)          # (F, T)
+        vad = self._last_gate
+        if vad is not None:
+            vad = ss._align_vad(np.asarray(vad, dtype=np.float32), power.shape[1])
+        spec_db, _ = ss.vad_modulated_gain(power, vad, self.spec_params)
+        # 安全强度旋钮同样作用于谱减，否则 strength<1 时会被谱减绕过
+        if self.strength != 1.0:
+            spec_db = spec_db * self.strength
+        self.stats["spectral_frames"] += int(T)
+        return ss.combine_gain_db(g_db, spec_db)
 
     # -- 硬门（保守模式）：白名单类极高置信 → 该窗直通（filter_safety §2.1） --
     def hard_gate_mask(self, probs_frames: np.ndarray) -> np.ndarray:
@@ -407,6 +481,7 @@ class SpectralGateAttenuator:
         if g.shape[1] < T:
             g = np.pad(g, ((0, 0), (0, T - g.shape[1])), mode="edge")
         g = self.apply_voice_gate(g, y, T)          # V2：帧级语音门控（10 ms 粒度）
+        g = self.overlay_spectral(g, Y, T)          # A 路线：逐时频点谱减，取小
         gain = torch.from_numpy(10.0 ** (g / 20.0)).to(Y.dtype)
         Y2 = Y * gain
 
@@ -443,6 +518,14 @@ class SpectralGateAttenuator:
         if lin.shape[1] < T:
             lin = np.pad(lin, ((0, 0), (0, T - lin.shape[1])), mode="edge")
         lin = self.apply_voice_gate(lin, y_ref, lin.shape[1])
+        if self.spectral:
+            # 与 process 同口径：复用同一套 STFT 参数算功率谱再叠谱减
+            win = torch.hann_window(fc.FILTER_WIN)
+            Yr = torch.stft(torch.from_numpy(np.ascontiguousarray(y_ref, dtype=np.float32)),
+                            n_fft=fc.FILTER_N_FFT, hop_length=fc.FILTER_HOP,
+                            win_length=fc.FILTER_WIN, window=win, center=True,
+                            return_complex=True)
+            lin = self.overlay_spectral(lin, Yr, Yr.shape[-1])
         return 10.0 ** (lin / 20.0)                                  # (257,T)
 
     @staticmethod

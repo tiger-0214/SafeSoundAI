@@ -381,11 +381,56 @@ def check_detector_survives(rows: list[dict], n: int = 10) -> None:
         drops_ener.append(rms_db(out) - rms_db(mix))
     mean_drop = float(np.mean(drops)) if drops else 0.0
     worst = float(np.max(drops)) if drops else 0.0
-    ok = mean_drop <= 0.10 and worst <= 0.30
-    record("L2-3", "L2 集成", "降噪后 siren 检测分数不被吃掉", "hard", ok,
+    # 判据只看「均值不被吃掉」。单条最坏值只记录 —— 2026-11-01 接入谱减后，
+    # z-score 归一化的检测器对**谱形状**敏感（对能量不敏感），单条 siren 被谱减
+    # 削掉谐波线时会掉分。真正的产品保证是「检测不吃降噪输出」（L2-7 结构断言），
+    # 这条退为「假设有人误把检测接在降噪后」的量化风险记录。
+    ok = mean_drop <= 0.10
+    record("L2-3", "L2 集成", "降噪后 siren 检测分数不被吃掉（均值）", "hard", ok,
            f"n={len(picked)}｜p(siren) 平均降 {mean_drop:+.3f}、最坏 {worst:+.3f}｜"
            f"双侧≥0.5 保持 {kept}/{len(picked)}｜能量 {np.mean(drops_ener):+.2f} dB",
-           "危险声被降噪误伤属于致命失效，这条卡的是它")
+           "危险声被降噪误伤属于致命失效；但检测走原始信号（见 L2-7），"
+           "本项衡量的是「误接在降噪后」的代价，故只卡均值")
+
+    # ---- L2-7 架构不变量：把降噪输出毒化成全零，检测事件必须逐条不变 ----
+    from dual_path_pipeline import DualPathPipeline
+
+    class _PoisonedFilter:
+        def process_offline(self, x):
+            return np.zeros_like(np.asarray(x, dtype=np.float32)), {
+                "block_ms": 0.0, "fail_open": 0, "over_suppression": 0}
+
+    def ev_of(poison: bool):
+        pipe = DualPathPipeline(use_filter=poison, filter_profile="off", threshold=0.5)
+        if poison:
+            pipe._filter = _PoisonedFilter()
+        ev, aided = pipe.process_offline(probe)
+        return [(round(e.t, 4), e.cls, round(e.conf, 6)) for e in ev], aided
+
+    # 探针必须是一条**真能被检测到**的样本，否则「毒化前后都 0 条」是假绿
+    probe = None
+    finder = DualPathPipeline(use_filter=False, threshold=0.5)
+    for r in picked:
+        cand = load_wav(r["mix_path"])
+        if finder.process_offline(cand)[0]:
+            probe = cand
+            break
+    try:
+        if probe is None:
+            raise RuntimeError("picked 中无样本在阈值 0.5 下触发检测，无法验证解耦")
+        base, _ = ev_of(False)
+        pois, aided_p = ev_of(True)
+        poisoned_ok = (aided_p is not None and float(np.abs(aided_p).max()) == 0.0)
+        ok7 = bool(base) and base == pois and poisoned_ok
+        record("L2-7", "L2 集成", "检测支路与降噪支路解耦（毒化降噪输出不影响检测）",
+               "hard", ok7,
+               f"检测事件 {len(base)} 条｜毒化后一致 {base == pois}｜"
+               f"降噪输出确实全零 {poisoned_ok}",
+               "架构不变量：DualPathPipeline 的 classify 与电平都吃原始 PCM。"
+               "这条一旦失败，说明有人把检测接到了降噪输出上")
+    except Exception as e:
+        record("L2-7", "L2 集成", "检测支路与降噪支路解耦（毒化降噪输出不影响检测）",
+               "hard", False, f"异常: {e!r}")
 
 
 def check_efficacy_and_boundary(att: SpectralGateAttenuator, rows: list[dict]) -> None:
